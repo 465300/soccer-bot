@@ -1,0 +1,2 @@
+python-telegram-bot[webhooks]==21.10
+pytz==2024.1

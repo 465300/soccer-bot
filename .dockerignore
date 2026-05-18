@@ -1,0 +1,7 @@
+.git/
+.claude/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env*
