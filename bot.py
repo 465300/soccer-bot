@@ -204,6 +204,24 @@ class SoccerBotV2:
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             cleared_at TIMESTAMP,
             UNIQUE(poll_id, username))''')
+        # Wallets table - track player wallet balances for payment eligibility
+        c.execute('''CREATE TABLE IF NOT EXISTS wallets (
+            user_id INTEGER,
+            username TEXT PRIMARY KEY COLLATE NOCASE,
+            balance DECIMAL(10,2) DEFAULT 0.00,
+            first_paid INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        # Payment confirmations table - audit trail for all payment flows
+        c.execute('''CREATE TABLE IF NOT EXISTS payment_confirmations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT COLLATE NOCASE,
+            amount DECIMAL(10,2),
+            payment_date TEXT,
+            confirmed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'pending',
+            notes TEXT)''')
         conn.commit()
         conn.close()
 
@@ -371,6 +389,107 @@ class SoccerBotV2:
         
         # Multiple groups - need interactive selection
         return (None, None)
+
+    def get_wallet(self, username: str) -> dict | None:
+        """Fetch wallet record by username. Returns dict or None if not found."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT user_id, username, balance, first_paid, created_at, updated_at FROM wallets WHERE LOWER(username) = LOWER(?)", (username,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            'user_id': row[0],
+            'username': row[1],
+            'balance': float(row[2]),
+            'first_paid': bool(row[3]),
+            'created_at': row[4],
+            'updated_at': row[5]
+        }
+
+    def check_wallet_eligible(self, username: str) -> tuple[bool, str]:
+        """Check if wallet is eligible for voting. Returns (eligible, reason)."""
+        wallet = self.get_wallet(username)
+        if not wallet:
+            return (False, "No wallet found. Please run /topup first.")
+        if wallet['balance'] <= 10.00:
+            return (False, f"Insufficient balance (${wallet['balance']:.2f}). Minimum required: $10.00. Run /topup to add funds.")
+        if not wallet['first_paid']:
+            return (False, "Payment not yet confirmed. Run /topup and confirm payment.")
+        return (True, "Eligible")
+
+    def credit_wallet(self, username: str, amount: float, reason: str = "topup") -> bool:
+        """Add funds to wallet, mark first_paid if this is first confirmation, log to payment_confirmations."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        now = datetime.now(TZ).isoformat()
+
+        # Get or create wallet
+        wallet = self.get_wallet(username)
+        if not wallet:
+            c.execute("INSERT INTO wallets (username, balance, first_paid) VALUES (?, ?, ?)",
+                     (username, amount, 1))
+        else:
+            new_balance = wallet['balance'] + amount
+            c.execute("UPDATE wallets SET balance = ?, first_paid = 1, updated_at = ? WHERE LOWER(username) = LOWER(?)",
+                     (new_balance, now, username))
+
+        # Log to payment_confirmations
+        c.execute("""INSERT INTO payment_confirmations
+                    (username, amount, payment_date, confirmed_date, status, notes)
+                    VALUES (?, ?, ?, ?, 'confirmed', ?)""",
+                 (username, amount, now, now, reason))
+        conn.commit()
+        conn.close()
+        return True
+
+    def deduct_wallet(self, username: str, amount: float, reason: str = "vote_cost") -> bool:
+        """Subtract funds from wallet. Returns False if insufficient balance."""
+        wallet = self.get_wallet(username)
+        if not wallet or wallet['balance'] < amount:
+            return False
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        now = datetime.now(TZ).isoformat()
+        new_balance = wallet['balance'] - amount
+
+        c.execute("UPDATE wallets SET balance = ?, updated_at = ? WHERE LOWER(username) = LOWER(?)",
+                 (new_balance, now, username))
+
+        # Log deduction as audit record (negative amount conceptually)
+        c.execute("""INSERT INTO payment_confirmations
+                    (username, amount, confirmed_date, status, notes)
+                    VALUES (?, ?, ?, 'confirmed', ?)""",
+                 (username, -amount, now, reason))
+        conn.commit()
+        conn.close()
+        return True
+
+    def get_payment_history(self, username: str, limit: int = 10) -> list[dict]:
+        """Fetch payment history for user, newest first."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""SELECT id, amount, payment_date, confirmed_date, status, notes
+                    FROM payment_confirmations
+                    WHERE LOWER(username) = LOWER(?)
+                    ORDER BY confirmed_date DESC LIMIT ?""",
+                 (username, limit))
+        rows = c.fetchall()
+        conn.close()
+
+        return [
+            {
+                'id': row[0],
+                'amount': float(row[1]),
+                'payment_date': row[2],
+                'confirmed_date': row[3],
+                'status': row[4],
+                'notes': row[5]
+            }
+            for row in rows
+        ]
 
     async def newseason_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['admin_id'] = update.effective_user.id
