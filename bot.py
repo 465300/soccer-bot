@@ -48,7 +48,7 @@ TOPUP_CUSTOM_AMOUNT = 120
 CASHOUT_AMOUNT, CASHOUT_HANDLE = 121, 122
 
 # ===== Payment / wallet config =====
-VENMO_HANDLE = '@ali-nazem-1'  # Venmo handle players pay to for top-ups
+VENMO_HANDLE = '@chico-leo'  # Venmo handle players pay to for top-ups
 VOTE_COST = 10.00      # charged per IN vote, refunded on switch to OUT
 WALLET_FLOOR = 15.00   # minimum balance required to vote IN
 TOPUP_MIN = 20.00      # minimum custom top-up amount
