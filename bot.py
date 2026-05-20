@@ -16,7 +16,6 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
     PicklePersistence,
-    PollAnswerHandler,
     filters,
 )
 import sqlite3
@@ -43,6 +42,16 @@ QP_CHOOSE_TYPE, QP_LOCATION_NAME, QP_LOCATION_LINK, QP_DATE, QP_TIME_START, QP_T
 
 # States for late arrivals input
 AWAITING_LATE_ARRIVALS_INPUT = 110
+
+# States for wallet conversations (custom top-up amount, cash-out)
+TOPUP_CUSTOM_AMOUNT = 120
+CASHOUT_AMOUNT, CASHOUT_HANDLE = 121, 122
+
+# ===== Payment / wallet config =====
+VENMO_HANDLE = '@ali-nazem-1'  # Venmo handle players pay to for top-ups
+VOTE_COST = 10.00      # charged per IN vote, refunded on switch to OUT
+WALLET_FLOOR = 15.00   # minimum balance required to vote IN
+TOPUP_MIN = 20.00      # minimum custom top-up amount
 
 
 class SoccerBotV2:
@@ -412,11 +421,11 @@ class SoccerBotV2:
         """Check if wallet is eligible for voting. Returns (eligible, reason)."""
         wallet = self.get_wallet(username)
         if not wallet:
-            return (False, "No wallet found. Please run /topup first.")
-        if wallet['balance'] <= 10.00:
-            return (False, f"Insufficient balance (${wallet['balance']:.2f}). Minimum required: $10.00. Run /topup to add funds.")
+            return (False, "You don't have a wallet yet. DM me /topup to add funds.")
         if not wallet['first_paid']:
-            return (False, "Payment not yet confirmed. Run /topup and confirm payment.")
+            return (False, "No confirmed payment yet. DM me /topup to add funds.")
+        if wallet['balance'] <= WALLET_FLOOR:
+            return (False, f"Balance too low (${wallet['balance']:.2f}). You need more than ${WALLET_FLOOR:.0f} to vote in. DM me /topup.")
         return (True, "Eligible")
 
     def credit_wallet(self, username: str, amount: float, reason: str = "topup") -> bool:
@@ -490,6 +499,268 @@ class SoccerBotV2:
             }
             for row in rows
         ]
+
+    # ===== WALLET: PLAYER COMMANDS =====
+
+    def low_balance_text(self, balance: float) -> str:
+        """Nudge message shown privately after a charge leaves a wallet at/under the floor."""
+        return (
+            f"⚠️ *Low wallet balance — ${balance:.2f}*\n\n"
+            f"Balance at ${WALLET_FLOOR:.0f} minimum. Top up to keep voting.\n\n"
+            "DM me /topup to add funds."
+        )
+
+    def build_topup_card(self) -> tuple:
+        """Build the top-up amount-selection message (text, keyboard). Reused by /topup and the gate."""
+        text = (
+            "💳 *Top up your wallet*\n\n"
+            f"Add funds via Venmo to join games — each game costs ${VOTE_COST:.0f} "
+            "from your balance.\n\n"
+            "We recommend *$50*: top up once, play several games, done. "
+            "Use *Custom* only if you need a different amount."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("$50", callback_data="topup:50"),
+             InlineKeyboardButton("$100", callback_data="topup:100")],
+            [InlineKeyboardButton("Custom", callback_data="topup:custom")],
+        ])
+        return text, keyboard
+
+    def build_venmo_card(self, amount: float) -> tuple:
+        """Build the Venmo payment-instructions message (text, keyboard) for a chosen amount."""
+        venmo_display = VENMO_HANDLE.replace('_', '\\_')
+        text = (
+            f"💵 *Pay ${amount:.2f} via Venmo*\n\n"
+            f"1. Send *${amount:.2f}* to *{venmo_display}* on Venmo\n"
+            "2. Come back to this chat\n"
+            "3. Tap *I've Paid* below\n\n"
+            "_Only tap confirm after you have actually sent the payment._"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ I've Paid", callback_data=f"ctopup:{amount}")],
+        ])
+        return text, keyboard
+
+    async def topup_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/topup — show the wallet top-up options privately."""
+        text, keyboard = self.build_topup_card()
+        await self.send(update, text, reply_markup=keyboard, parse_mode='Markdown')
+
+    async def send_topup_prompt(self, user_id: int, reason: str = ""):
+        """DM a user the top-up card — used by the wallet gate when a vote is blocked."""
+        text, keyboard = self.build_topup_card()
+        if reason:
+            text = f"🚫 {reason}\n\n" + text
+        try:
+            await self.application.bot.send_message(
+                chat_id=user_id, text=text, reply_markup=keyboard, parse_mode='Markdown')
+        except Exception as e:
+            logger.warning(f"Could not DM top-up prompt to {user_id}: {e}")
+
+    async def handle_topup_callback(self, query, arg: str):
+        """Handle the $50 / $100 preset buttons on the top-up card."""
+        await query.answer()
+        try:
+            amount = float(arg)
+        except ValueError:
+            return
+        text, keyboard = self.build_venmo_card(amount)
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
+
+    async def confirm_topup(self, query, amount: float):
+        """Player tapped 'I've Paid' — credit the wallet (trust-based) and confirm."""
+        await query.answer()
+        user = query.from_user
+        username = user.username or user.first_name
+        self.credit_wallet(username, amount, "topup")
+        wallet = self.get_wallet(username)
+        balance = wallet['balance'] if wallet else amount
+        await query.edit_message_text(
+            f"✅ *${amount:.2f} added* — your balance is now *${balance:.2f}*.\n\n"
+            "You're set for the next few games. We'll nudge you when it's time "
+            "to top up again.",
+            parse_mode='Markdown')
+
+    async def topup_custom_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Entry point for the Custom top-up amount conversation."""
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(
+            f"✏️ *Custom top-up*\n\nType the amount you'd like to add "
+            f"(minimum ${TOPUP_MIN:.0f}).\n\nSend /cancel to stop.",
+            parse_mode='Markdown')
+        return TOPUP_CUSTOM_AMOUNT
+
+    async def topup_custom_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Receive and validate the custom top-up amount."""
+        raw = update.message.text.strip().lstrip('$')
+        try:
+            amount = round(float(raw), 2)
+        except ValueError:
+            await self.send(update, "❌ Please send a number, like 75.")
+            return TOPUP_CUSTOM_AMOUNT
+        if amount < TOPUP_MIN:
+            await self.send(update, f"❌ Minimum top-up is ${TOPUP_MIN:.0f}. Send a larger amount.")
+            return TOPUP_CUSTOM_AMOUNT
+        text, keyboard = self.build_venmo_card(amount)
+        await self.send(update, text, reply_markup=keyboard, parse_mode='Markdown')
+        return ConversationHandler.END
+
+    async def topup_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel the custom top-up conversation."""
+        await self.send(update, "Top-up cancelled.")
+        return ConversationHandler.END
+
+    async def wallet_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/wallet — show balance, eligibility, and recent activity privately."""
+        user = update.effective_user
+        username = user.username or user.first_name
+        wallet = self.get_wallet(username)
+        if not wallet:
+            await self.send(update, "You don't have a wallet yet. Run /topup to get started.")
+            return
+        eligible, _ = self.check_wallet_eligible(username)
+        status = "✅ Eligible to vote in" if eligible else f"⚠️ Top up to vote (need more than ${WALLET_FLOOR:.0f})"
+        text = (
+            "💰 *Your Wallet*\n\n"
+            f"Balance: *${wallet['balance']:.2f}*\n"
+            f"Status: {status}\n"
+        )
+        history = self.get_payment_history(username, 3)
+        if history:
+            text += "\n*Recent activity:*\n"
+            for h in history:
+                amt = h['amount']
+                sign = "+" if amt >= 0 else "−"
+                label = self._txn_label(h['notes'])
+                when = self._short_date(h['confirmed_date'])
+                text += f"  {sign}${abs(amt):.2f}  {label}  _{when}_\n"
+        await self.send(update, text, parse_mode='Markdown')
+
+    def _txn_label(self, notes: str) -> str:
+        """Human-readable label for a payment_confirmations.notes value."""
+        if not notes:
+            return "transaction"
+        if notes.startswith("topup"):
+            return "top-up"
+        if notes.startswith("quickpoll_vote"):
+            return "game vote"
+        if notes.startswith("quickpoll_refund"):
+            return "vote refund"
+        if notes.startswith("quickpoll_cancelled"):
+            return "game cancelled (refund)"
+        if notes.startswith("cashout"):
+            return "cash-out"
+        return notes
+
+    def _short_date(self, iso_str: str) -> str:
+        """Format an ISO timestamp as a short 'Feb 26' date; fall back to the raw value."""
+        if not iso_str:
+            return ""
+        try:
+            return datetime.fromisoformat(iso_str).strftime("%b %d")
+        except (ValueError, TypeError):
+            return str(iso_str)[:10]
+
+    async def cashout_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/cashout — begin a withdrawal request."""
+        user = update.effective_user
+        username = user.username or user.first_name
+        wallet = self.get_wallet(username)
+        if not wallet or wallet['balance'] <= 0:
+            await self.send(update, "Your wallet is empty — nothing to cash out.")
+            return ConversationHandler.END
+        context.user_data['cashout_username'] = username
+        await self.send(
+            update,
+            f"💸 *Cash out*\n\nYour balance is *${wallet['balance']:.2f}*.\n\n"
+            "How much would you like to withdraw? Send an amount, or /cancel.",
+            parse_mode='Markdown')
+        return CASHOUT_AMOUNT
+
+    async def cashout_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Receive and validate the cash-out amount."""
+        username = context.user_data.get('cashout_username')
+        raw = update.message.text.strip().lstrip('$')
+        try:
+            amount = round(float(raw), 2)
+        except ValueError:
+            await self.send(update, "❌ Please send a number, like 40.")
+            return CASHOUT_AMOUNT
+        wallet = self.get_wallet(username)
+        balance = wallet['balance'] if wallet else 0
+        if amount <= 0:
+            await self.send(update, "❌ Enter an amount greater than zero.")
+            return CASHOUT_AMOUNT
+        if amount > balance:
+            await self.send(update, f"❌ You can't cash out more than your balance (${balance:.2f}).")
+            return CASHOUT_AMOUNT
+        context.user_data['cashout_amount'] = amount
+        await self.send(update, "What's your Venmo handle? (e.g. @your-name)")
+        return CASHOUT_HANDLE
+
+    async def cashout_handle(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Receive the Venmo handle, deduct the funds, and notify the admin."""
+        username = context.user_data.get('cashout_username')
+        amount = context.user_data.get('cashout_amount', 0)
+        venmo = update.message.text.strip()
+        ok = self.deduct_wallet(username, amount, f"cashout to {venmo}")
+        if not ok:
+            await self.send(update, "❌ Cash-out failed — your balance changed. Run /cashout again.")
+            return ConversationHandler.END
+        wallet = self.get_wallet(username)
+        balance = wallet['balance'] if wallet else 0
+        venmo_md = venmo.replace('_', '\\_').replace('*', '\\*')
+        username_md = (username or "").replace('_', '\\_').replace('*', '\\*')
+        await self.send(
+            update,
+            f"✅ *Cash-out confirmed* — ${amount:.2f} to {venmo_md}.\n\n"
+            "The money will land in your Venmo account within a few minutes.\n"
+            f"Remaining wallet balance: *${balance:.2f}*.",
+            parse_mode='Markdown')
+        note = (
+            "💸 *Cash-out request*\n\n"
+            f"Player: {username_md}\n"
+            f"Amount: *${amount:.2f}*\n"
+            f"Venmo: {venmo_md}\n\n"
+            "Send this payment from your Venmo account."
+        )
+        await self.notify_admins(note)
+        context.user_data.pop('cashout_username', None)
+        context.user_data.pop('cashout_amount', None)
+        return ConversationHandler.END
+
+    async def cashout_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel the cash-out conversation."""
+        await self.send(update, "Cash-out cancelled.")
+        return ConversationHandler.END
+
+    async def notify_admins(self, text: str):
+        """DM every known admin (by user_id). Used for cash-out alerts."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT user_id FROM chat_admins WHERE user_id IS NOT NULL")
+        admin_ids = [r[0] for r in c.fetchall()]
+        conn.close()
+        if not admin_ids:
+            logger.warning(f"notify_admins: no admin user_id on record. Message: {text}")
+            return
+        for aid in admin_ids:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=aid, text=text, parse_mode='Markdown')
+            except Exception as e:
+                logger.warning(f"Could not notify admin {aid}: {e}")
+
+    async def close_quickpoll_buttons(self, chat_id: int, message_id):
+        """Remove the in/out/status buttons from a quickpoll message to stop voting."""
+        if not message_id:
+            return
+        try:
+            await self.application.bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=message_id, reply_markup=None)
+        except Exception as e:
+            logger.warning(f"Could not close quickpoll buttons ({message_id}): {e}")
 
     async def newseason_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['admin_id'] = update.effective_user.id
@@ -776,6 +1047,15 @@ Miss it = Miss the game. No exceptions."""
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
+
+        # Wallet / top-up callbacks (colon-delimited, handled before the '_' split)
+        if query.data.startswith('topup:'):
+            await self.handle_topup_callback(query, query.data.split(':', 1)[1])
+            return
+        if query.data.startswith('ctopup:'):
+            await self.confirm_topup(query, float(query.data.split(':', 1)[1]))
+            return
+
         data = query.data.split('_')
 
         if data[0] == 'vote':
@@ -849,24 +1129,110 @@ Miss it = Miss the game. No exceptions."""
         await query.message.reply_text("Use /newseason to set up a new season." if action != 'stop' else "✅ Season stopped.")
 
     async def process_quickpoll_vote(self, query, poll_id: int, vote_type: str):
-        """Process a vote on a quick poll"""
+        """Process a vote on a quick poll — enforces the wallet gate and per-vote charge."""
         user = query.from_user
+        username = user.username or user.first_name
+
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        
+
         # Create votes table for quickpolls if not exists
         c.execute('''CREATE TABLE IF NOT EXISTS quickpoll_votes (
             id INTEGER PRIMARY KEY, poll_id INTEGER, user_id INTEGER, username TEXT, vote_type TEXT,
             voted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(poll_id, user_id))''')
-        
+
+        # Poll must still exist and be open
+        c.execute("SELECT deadline_time, max_players FROM quickpolls WHERE id = ?", (poll_id,))
+        prow = c.fetchone()
+        if not prow:
+            conn.close()
+            await query.answer("This poll no longer exists.", show_alert=True)
+            return
+        max_players = prow[1]
+        if prow[0]:
+            try:
+                deadline = datetime.fromisoformat(prow[0])
+                if deadline.tzinfo is None:
+                    deadline = TZ.localize(deadline)
+                if datetime.now(TZ) > deadline:
+                    conn.close()
+                    await query.answer("⏰ Voting has closed for this poll.", show_alert=True)
+                    return
+            except (ValueError, TypeError):
+                pass
+
+        # Late-arrival block — players blocked from this poll cannot vote
+        c.execute("""SELECT 1 FROM late_arrivals
+                     WHERE blocked_from_poll_id = ? AND LOWER(username) = LOWER(?)
+                     AND cleared_at IS NULL""", (poll_id, username))
+        if c.fetchone():
+            conn.close()
+            await query.answer(
+                "⚠️ You arrived late to the previous game and can't join this poll.",
+                show_alert=True)
+            return
+
+        # Read the existing vote (drives idempotency + refund detection)
+        c.execute("SELECT vote_type FROM quickpoll_votes WHERE poll_id = ? AND user_id = ?",
+                  (poll_id, user.id))
+        erow = c.fetchone()
+        old_vote = erow[0] if erow else None
+
+        # No change — do not re-charge (idempotency)
+        if old_vote == vote_type:
+            conn.close()
+            await query.answer(f"You already voted {vote_type.upper()}.")
+            return
+
+        # Switching INTO 'in' — enforce the capacity cap, then the wallet gate
+        if vote_type == 'in':
+            c.execute("SELECT COUNT(*) FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
+            in_count = c.fetchone()[0]
+            if max_players and in_count >= max_players:
+                conn.close()
+                await query.answer(
+                    f"⚽ This game is full — all {max_players} spots are taken.",
+                    show_alert=True)
+                return
+            eligible, reason = self.check_wallet_eligible(username)
+            if not eligible:
+                conn.close()
+                await query.answer(reason, show_alert=True)
+                await self.send_topup_prompt(user.id, reason)
+                return
+
+        # Record the vote
         c.execute('INSERT OR REPLACE INTO quickpoll_votes (poll_id, user_id, username, vote_type) VALUES (?, ?, ?, ?)',
-                  (poll_id, user.id, user.username or user.first_name, vote_type))
+                  (poll_id, user.id, username, vote_type))
         conn.commit()
         conn.close()
-        
-        emoji = {'in': '✅', 'out': '❌', 'guest': '👥'}
-        label = {'in': 'IN', 'out': 'OUT', 'guest': 'Guest'}
-        await query.answer(f"{emoji.get(vote_type, '✅')} You voted {label.get(vote_type, vote_type)} — tap another to change")
+
+        # Money: charge on entering 'in', refund on leaving 'in'
+        charged = False
+        if old_vote != 'in' and vote_type == 'in':
+            self.deduct_wallet(username, VOTE_COST, f"quickpoll_vote:{poll_id}")
+            charged = True
+        elif old_vote == 'in' and vote_type != 'in':
+            self.credit_wallet(username, VOTE_COST, f"quickpoll_refund:{poll_id}")
+
+        # Confirmation popup
+        if vote_type == 'in':
+            await query.answer(f"✅ You're IN — ${VOTE_COST:.0f} deducted from your wallet.")
+        else:
+            note = f" ${VOTE_COST:.0f} refunded." if old_vote == 'in' else ""
+            await query.answer(f"❌ You're OUT.{note}")
+
+        # Low-balance nudge after a charge
+        if charged:
+            wallet = self.get_wallet(username)
+            if wallet and wallet['balance'] <= WALLET_FLOOR:
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=user.id,
+                        text=self.low_balance_text(wallet['balance']),
+                        parse_mode='Markdown')
+                except Exception as e:
+                    logger.warning(f"Could not send low-balance nudge to {user.id}: {e}")
 
     async def show_quickpoll_status(self, query, poll_id: int):
         """Show status of a quick poll"""
@@ -887,12 +1253,11 @@ Miss it = Miss the game. No exceptions."""
         
         in_count = counts.get('in', 0)
         out_count = counts.get('out', 0)
-        guest_count = counts.get('guest', 0)
-        
-        vote_labels = {'in': '✅ IN', 'out': '❌ OUT', 'guest': '👥 Guest'}
+
+        vote_labels = {'in': '✅ IN', 'out': '❌ OUT'}
         my_vote_str = vote_labels.get(my_vote[0], 'Unknown') if my_vote else 'Not voted yet'
-        
-        await query.answer(f"📊 Your vote: {my_vote_str}\n\nIN: {in_count} | OUT: {out_count} | Guests: {guest_count} | Total: {in_count + guest_count}/{max_players}", show_alert=True)
+
+        await query.answer(f"📊 Your vote: {my_vote_str}\n\nIN: {in_count} | OUT: {out_count} | Total: {in_count}/{max_players}", show_alert=True)
 
     async def add_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
@@ -1364,13 +1729,11 @@ Miss it = Miss the game. No exceptions."""
             poll_id = poll[0]
             poll_num_teams = poll[1]
             
-            # Get IN voters and Guests
+            # Get IN voters
             c.execute("SELECT user_id, username FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
             in_voters = c.fetchall()
-            c.execute("SELECT user_id, username FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'guest'", (poll_id,))
-            guests = c.fetchall()
-            
-            all_players = in_voters + guests
+
+            all_players = in_voters
             
             if not all_players:
                 await self.send(update, "❌ No players voted IN yet. Use `/maketeams all`.", parse_mode='Markdown')
@@ -1586,39 +1949,11 @@ Miss it = Miss the game. No exceptions."""
         if not is_admin:
             await self.send(update, "❌ You are not authorized to use this command.")
             return ConversationHandler.END
-        
+
         context.user_data['qp'] = {}
         context.user_data['qp']['admin_id'] = update.effective_user.id
-        
-        # Step 0: Choose poll type
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Standard (w/ Guests)", callback_data="qp_type:standard"),
-                InlineKeyboardButton("⚡ Simple (FCFS)", callback_data="qp_type:simple")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        msg_text = "⚡ *Quick Poll Setup*\n\nFirst, choose the poll type:\n" \
-                   "• **Standard**: IN/OUT + Guest option.\n" \
-                   "• **Simple**: IN/OUT only (First-Come-First-Serve)."
-        
-        await self.send(update, msg_text, reply_markup=reply_markup, parse_mode='Markdown')
-        return QP_CHOOSE_TYPE
 
-    async def qp_type_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        
-        data = query.data
-        if data == "qp_type:standard":
-             context.user_data['qp']['allow_guests'] = True
-             await query.edit_message_text("✅ Selected: **Standard** (Guests allowed)", parse_mode='Markdown')
-        elif data == "qp_type:simple":
-             context.user_data['qp']['allow_guests'] = False
-             await query.edit_message_text("⚡ Selected: **Simple** (Members only, FCFS)", parse_mode='Markdown')
-        
-        # Proceed to Step 1
-        await self.send(update, "Step 1/8: Enter *location name*:")
+        await self.send(update, "⚡ *Quick Poll Setup*\n\nStep 1/8: Enter *location name*:", parse_mode='Markdown')
         return QP_LOCATION_NAME
 
     async def qp_get_location_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1750,8 +2085,7 @@ Miss it = Miss the game. No exceptions."""
             max_players=qp['max_players'],
             deadline_time=deadline_time,
             num_teams=qp.get('num_teams', 0),
-            admin_id=qp['admin_id'],
-            allow_guests=qp.get('allow_guests', True)
+            admin_id=qp['admin_id']
         )
         
         if deadline_time:
@@ -1786,7 +2120,7 @@ Miss it = Miss the game. No exceptions."""
 
     async def send_quickpoll(self, chat_id: int, location_name: str, location_link: str, 
                              game_date: str, time_start: str, time_end: str, max_players: int,
-                             deadline_time, num_teams: int, admin_id: int, allow_guests: bool = True):
+                             deadline_time, num_teams: int, admin_id: int):
         """Send a quick poll using native Telegram poll with reply-to trick"""
         
         poll_id = int(datetime.now().timestamp())
@@ -1809,21 +2143,26 @@ Miss it = Miss the game. No exceptions."""
             parse_mode='Markdown', disable_web_page_preview=True
         )
 
-        # Determine options based on poll type
-        options = ["IN ✅", "OUT ❌"]
-        if allow_guests:
-            options.append("Guest 👥")
-
-        # Send native poll as a reply
-        poll_msg = await self.application.bot.send_poll(
+        # Send the poll as an inline-button message (reply to the info message)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("in", callback_data=f"qvote_{poll_id}_in"),
+            InlineKeyboardButton("out", callback_data=f"qvote_{poll_id}_out"),
+            InlineKeyboardButton("status", callback_data=f"qstatus_{poll_id}"),
+        ]])
+        poll_text = (
+            f"⚽ *Are you playing on {game_date}?*\n\n"
+            f"Tap *in* or *out* below. Each game costs ${VOTE_COST:.0f} from your "
+            "wallet — switch to *out* anytime before the deadline for a full refund.\n\n"
+            "Tap *status* to see the current count."
+        )
+        poll_msg = await self.application.bot.send_message(
             chat_id=chat_id,
-            question=f"Are you playing on {game_date}? ⚽",
-            options=options,
-            is_anonymous=False,
-            allows_multiple_answers=False,
+            text=poll_text,
+            parse_mode='Markdown',
+            reply_markup=keyboard,
             reply_to_message_id=info_msg.message_id,
         )
-        
+
         # Auto-pin the poll
         try:
             await self.application.bot.pin_chat_message(
@@ -1836,10 +2175,10 @@ Miss it = Miss the game. No exceptions."""
         deadline_iso = deadline_time.isoformat() if deadline_time else None
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute('''INSERT INTO quickpolls (id, location_name, max_players, deadline_time, num_teams, chat_id, admin_id, allow_guests, telegram_poll_id, poll_message_id, game_date, time_start)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        c.execute('''INSERT INTO quickpolls (id, location_name, max_players, deadline_time, num_teams, chat_id, admin_id, telegram_poll_id, poll_message_id, game_date, time_start)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                   (poll_id, location_name, max_players, deadline_iso, num_teams, chat_id, admin_id,
-                   int(allow_guests), poll_msg.poll.id, poll_msg.message_id, game_date, time_start))
+                   None, poll_msg.message_id, game_date, time_start))
         
         # Link any pending late arrivals from previous polls to this new poll
         # (auto-link for next poll feature)
@@ -2069,40 +2408,28 @@ Miss it = Miss the game. No exceptions."""
                 )
 
     async def post_roster(self, poll_id: int, chat_id: int, force_send: bool = False):
-        """Post the final roster — who's playing today (members + guests with continuous numbering)"""
+        """Post the final roster — everyone who voted IN (the cap is enforced at voting time)"""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        
-        c.execute("SELECT max_players, admin_id, allow_guests, game_date, time_start FROM quickpolls WHERE id = ?", (poll_id,))
+
+        c.execute("SELECT max_players, admin_id, game_date, time_start FROM quickpolls WHERE id = ?", (poll_id,))
         poll = c.fetchone()
         if not poll:
             conn.close()
             return
         max_players = poll[0]
         admin_id = poll[1]
-        allow_guests = bool(poll[2]) if poll[2] is not None else True
-        game_date = poll[3]
-        time_start = poll[4]
-        
-        # Get IN votes (members) ordered chronologically
-        c.execute("""SELECT username FROM quickpoll_votes 
-                     WHERE poll_id = ? AND vote_type = 'in' 
+        game_date = poll[2]
+        time_start = poll[3]
+
+        # Get IN votes ordered chronologically
+        c.execute("""SELECT username FROM quickpoll_votes
+                     WHERE poll_id = ? AND vote_type = 'in'
                      ORDER BY voted_at ASC""", (poll_id,))
-        in_voters = [r[0] for r in c.fetchall()]
-        
-        # Get Guest votes ordered chronologically
-        c.execute("""SELECT username FROM quickpoll_votes 
-                     WHERE poll_id = ? AND vote_type = 'guest' 
-                     ORDER BY voted_at ASC""", (poll_id,))
-        guest_voters = [r[0] for r in c.fetchall()]
+        players_in = [r[0] for r in c.fetchall()]
         conn.close()
-        
-        # Cap at max_players total (members first, then guests fill remaining)
-        members_in = in_voters[:max_players]
-        remaining_slots = max(0, max_players - len(members_in))
-        guests_in = guest_voters[:remaining_slots]
-        
-        total = len(members_in) + len(guests_in)
+
+        total = len(players_in)
         
         if total == 0:
             msg = "📋 No players voted IN for this game."
@@ -2130,9 +2457,8 @@ Miss it = Miss the game. No exceptions."""
         header = f"✅ *You are playing tonight on {game_date_display} at {time_display}*\n⏰ *Be on time or sit out next week.*\n\n"
         text = header
         
-        # Continuous numbered list (all players together)
-        all_players = members_in + guests_in
-        for i, name in enumerate(all_players, 1):
+        # Continuous numbered list of everyone who's IN
+        for i, name in enumerate(players_in, 1):
             safe = name.replace('_', '\\_')
             text += f"{i}. {safe}\n"
         
@@ -2171,68 +2497,13 @@ Miss it = Miss the game. No exceptions."""
             return
         
         poll_id, chat_id, poll_msg_id = poll
-        
-        # Stop the native poll
-        if poll_msg_id:
-            try:
-                await self.application.bot.stop_poll(chat_id=chat_id, message_id=poll_msg_id)
-            except Exception:
-                pass
-        
+
+        # Disable the poll buttons
+        await self.close_quickpoll_buttons(chat_id, poll_msg_id)
+
         # Post the roster (goes to admin approval unless force_send=True)
         await self.post_roster(poll_id, chat_id)
         await self.send(update, "✅ Poll closed! Check your DMs to approve and post the roster.")
-
-    async def handle_poll_answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle native poll votes — track in DB for team creation"""
-        answer = update.poll_answer
-        telegram_poll_id = answer.poll_id
-        user = answer.user
-
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT id FROM quickpolls WHERE telegram_poll_id = ?", (telegram_poll_id,))
-        result = c.fetchone()
-
-        if not result:
-            conn.close()
-            return
-
-        poll_id = result[0]
-        
-        # Check if user is blocked from this poll (was late to previous poll)
-        username = user.username or user.first_name
-        c.execute("""SELECT 1 FROM late_arrivals 
-                     WHERE blocked_from_poll_id = ? AND LOWER(username) = LOWER(?)
-                     AND cleared_at IS NULL""",
-                  (poll_id, username))
-        if c.fetchone():
-            # User is blocked - reject their vote
-            c.execute('DELETE FROM quickpoll_votes WHERE poll_id = ? AND user_id = ?', (poll_id, user.id))
-            conn.commit()
-            conn.close()
-            
-            # Notify user
-            try:
-                await self.application.bot.send_message(
-                    chat_id=user.id,
-                    text="⚠️ You arrived late to the previous game and cannot participate in this poll.\nTry to be on time next time! ⏰"
-                )
-            except Exception as e:
-                logger.warning(f"Could not send blocked user notification to {user.id}: {e}")
-            return
-        
-        option_map = {0: 'in', 1: 'out', 2: 'guest'}
-
-        if answer.option_ids:  # User voted
-            vote_type = option_map.get(answer.option_ids[0], 'in')
-            c.execute('INSERT OR REPLACE INTO quickpoll_votes (poll_id, user_id, username, vote_type) VALUES (?, ?, ?, ?)',
-                      (poll_id, user.id, username, vote_type))
-        else:  # User retracted vote
-            c.execute('DELETE FROM quickpoll_votes WHERE poll_id = ? AND user_id = ?', (poll_id, user.id))
-
-        conn.commit()
-        conn.close()
 
     async def finalize_teams(self, poll_id: int, chat_id: int, admin_id: int):
         """Called at deadline - creates balanced teams and posts to group"""
@@ -2254,23 +2525,9 @@ Miss it = Miss the game. No exceptions."""
                      ORDER BY voted_at ASC""", (poll_id,))
         in_votes = c.fetchall()
         
-        # Get guest votes ordered by time
-        c.execute("""SELECT user_id, username, voted_at FROM quickpoll_votes 
-                     WHERE poll_id = ? AND vote_type = 'guest' 
-                     ORDER BY voted_at ASC""", (poll_id,))
-        guest_votes = c.fetchall()
-        
         # Build final player list (first come first serve up to max)
         final_players = []
-        
-        # Add members first (up to max)
         for user_id, username, voted_at in in_votes:
-            if len(final_players) >= max_players:
-                break
-            final_players.append({'user_id': user_id, 'username': username})
-        
-        # Fill remaining slots with guests
-        for user_id, username, voted_at in guest_votes:
             if len(final_players) >= max_players:
                 break
             final_players.append({'user_id': user_id, 'username': username})
@@ -2349,8 +2606,8 @@ Miss it = Miss the game. No exceptions."""
         c = conn.cursor()
         
         # Get IN voters from the quickpoll
-        c.execute("""SELECT username FROM quickpoll_votes 
-                     WHERE poll_id = ? AND vote_type IN ('in', 'guest')
+        c.execute("""SELECT username FROM quickpoll_votes
+                     WHERE poll_id = ? AND vote_type = 'in'
                      ORDER BY voted_at ASC""", (poll_id,))
         in_players = [row[0] for row in c.fetchall()]
         conn.close()
@@ -2461,10 +2718,7 @@ Miss it = Miss the game. No exceptions."""
                         qp_row = cc.fetchone()
                         cconn.close()
                         if qp_row and qp_row[0]:
-                            try:
-                                await self.application.bot.stop_poll(chat_id=qp_chat_id, message_id=qp_row[0])
-                            except Exception:
-                                pass
+                            await self.close_quickpoll_buttons(qp_chat_id, qp_row[0])
                         await self.post_roster(qp_poll_id, qp_chat_id)
                     elif event_type == 'finalize_teams':
                         await self.finalize_teams(payload['poll_id'], payload['chat_id'], payload['admin_id'])
@@ -2525,39 +2779,46 @@ Miss it = Miss the game. No exceptions."""
 
         poll_id, chat_id = poll
 
-        # Cancel pending finalize_teams events for this poll
-        c.execute("SELECT id, payload FROM scheduled_events WHERE event_type = 'finalize_teams' AND executed = 0")
+        # Cancel pending deadline events (teams + auto-close) for this poll
+        c.execute("SELECT id, payload FROM scheduled_events WHERE event_type IN ('finalize_teams', 'close_quickpoll') AND executed = 0")
         for eid, payload_json in c.fetchall():
             payload = json.loads(payload_json)
             if payload.get('poll_id') == poll_id:
                 c.execute("UPDATE scheduled_events SET executed = 1 WHERE id = ?", (eid,))
 
-        # Stop the native poll if it exists
+        # Collect IN voters so their per-vote charge can be refunded
+        c.execute("SELECT username FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
+        in_voters = [r[0] for r in c.fetchall()]
+
+        # Disable the poll buttons if the message exists
         c.execute("SELECT poll_message_id FROM quickpolls WHERE id = ?", (poll_id,))
         res = c.fetchone()
         poll_msg_id = res[0] if res else None
-        
+
+        # Clear the votes so the poll can't be cancelled (and refunded) twice
+        c.execute("DELETE FROM quickpoll_votes WHERE poll_id = ?", (poll_id,))
+
         # Determine who to ask for approval (the user who ran the command)
         admin_id = update.effective_user.id
-        
-        if poll_msg_id:
-            try:
-                await self.application.bot.stop_poll(chat_id=chat_id, message_id=poll_msg_id)
-            except Exception:
-                pass
-        
+
+        await self.close_quickpoll_buttons(chat_id, poll_msg_id)
+
         conn.commit()
         conn.close()
-        
+
+        # Refund every IN voter — the game was cancelled, nobody should be charged
+        for voter in in_voters:
+            self.credit_wallet(voter, VOTE_COST, f"quickpoll_cancelled:{poll_id}")
+
         # Instead of posting to group immediately, ask admin for approval
         await self.request_approval(
-            admin_id, 
-            "❌ *Quick poll has been cancelled!*", 
+            admin_id,
+            f"❌ *Quick poll has been cancelled!*\n💸 {len(in_voters)} player(s) refunded ${VOTE_COST:.0f} each.",
             f"cancel:{poll_id}:{chat_id}",
             "Post cancellation notice to group?"
         )
-        
-        await self.send(update, "✅ Quick poll cancelled (approval request sent).")
+
+        await self.send(update, f"✅ Quick poll cancelled. {len(in_voters)} player(s) refunded ${VOTE_COST:.0f} each.")
 
     async def cancelgame_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel a game session in the active season: /cancelgame [week]"""
@@ -2703,7 +2964,6 @@ Miss it = Miss the game. No exceptions."""
         quickpoll_handler = ConversationHandler(
             entry_points=[CommandHandler('quickpoll', self.quickpoll_start, filters=filters.ChatType.PRIVATE)],
             states={
-                QP_CHOOSE_TYPE: [CallbackQueryHandler(self.qp_type_response)],
                 QP_LOCATION_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_location_name)],
                 QP_LOCATION_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_location_link)],
                 QP_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_date)],
@@ -2723,7 +2983,27 @@ Miss it = Miss the game. No exceptions."""
             persistent=True,
         )
         self.application.add_handler(quickpoll_handler)
-        
+
+        # Wallet conversations: custom top-up amount + cash-out
+        topup_custom_handler = ConversationHandler(
+            entry_points=[CallbackQueryHandler(self.topup_custom_start, pattern='^topup:custom$')],
+            states={
+                TOPUP_CUSTOM_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.topup_custom_amount)],
+            },
+            fallbacks=[CommandHandler('cancel', self.topup_cancel)],
+        )
+        self.application.add_handler(topup_custom_handler)
+
+        cashout_handler = ConversationHandler(
+            entry_points=[CommandHandler('cashout', self.cashout_start, filters=filters.ChatType.PRIVATE)],
+            states={
+                CASHOUT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.cashout_amount)],
+                CASHOUT_HANDLE: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.cashout_handle)],
+            },
+            fallbacks=[CommandHandler('cancel', self.cashout_cancel)],
+        )
+        self.application.add_handler(cashout_handler)
+
         # Admin commands with private chat filters
         self.application.add_handler(CommandHandler('setchat', self.set_chat))  # Works in both group and private
         self.application.add_handler(CommandHandler('addadmin', self.addadmin_cmd, filters=filters.ChatType.PRIVATE))
@@ -2748,7 +3028,9 @@ Miss it = Miss the game. No exceptions."""
         self.application.add_handler(CommandHandler('closepoll', self.closepoll_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('cancelquickpoll', self.cancelquickpoll_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('cancelgame', self.cancelgame_cmd, filters=filters.ChatType.PRIVATE))
-        
+        self.application.add_handler(CommandHandler('wallet', self.wallet_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('topup', self.topup_cmd, filters=filters.ChatType.PRIVATE))
+
         # Handler for late arrivals input (captures admin's response to prompt)
         self.application.add_handler(MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
@@ -2756,7 +3038,6 @@ Miss it = Miss the game. No exceptions."""
         ))
         
         # Public handlers - anyone can use these
-        self.application.add_handler(PollAnswerHandler(self.handle_poll_answer))
         self.application.add_handler(CallbackQueryHandler(self.handle_approval_callback, pattern='^(approve|discard):'))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
 
