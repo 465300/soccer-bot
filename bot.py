@@ -7,7 +7,15 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,6 +24,7 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
     PicklePersistence,
+    ApplicationHandlerStop,
     filters,
 )
 import sqlite3
@@ -38,7 +47,7 @@ WEBHOOK_PORT = int(os.getenv('PORT', '8080'))
 LOCATION_NAME, LOCATION_LINK, GAME_DAY, GAME_TIME_START, GAME_TIME_END, START_DATE, DURATION, MAX_PLAYERS = range(8)
 
 # States for quickpoll conversation
-QP_GROUP_SELECT, QP_LOCATION_NAME, QP_LOCATION_LINK, QP_DATE, QP_TIME_START, QP_TIME_END, QP_MAX_PLAYERS, QP_DEADLINE, QP_AUTO_TEAMS, QP_NUM_TEAMS = range(100, 111)
+QP_GROUP_SELECT, QP_LOCATION_NAME, QP_LOCATION_LINK, QP_DATE, QP_TIME_START, QP_TIME_END, QP_MAX_PLAYERS, QP_DEADLINE, QP_AUTO_TEAMS, QP_NUM_TEAMS = range(100, 110)
 
 # States for late arrivals input
 AWAITING_LATE_ARRIVALS_INPUT = 110
@@ -52,6 +61,20 @@ VENMO_HANDLE = '@chico-leo'  # Venmo handle players pay to for top-ups
 VOTE_COST = 10.00      # charged per IN vote, refunded on switch to OUT
 WALLET_FLOOR = 15.00   # minimum balance required to vote IN
 TOPUP_MIN = 20.00      # minimum custom top-up amount
+
+# Super-admin controls: only this user can manage admin lifecycle
+_raw_super_admin_id = os.getenv('SUPER_ADMIN_ID', '').strip()
+SUPER_ADMIN_ID = int(_raw_super_admin_id) if _raw_super_admin_id.isdigit() else 0
+
+# Role-based command routing for private chats
+PLAYER_COMMANDS = {'wallet', 'topup', 'cashout', 'cancel'}
+ADMIN_COMMANDS = {
+    'newseason', 'quickpoll', 'status', 'testpoll', 'cancelgame', 'cancelquickpoll',
+    'closepoll', 'maketeams', 'addmember', 'removemember', 'addregular',
+    'removeregular', 'members', 'setskill', 'skills', 'deleteskill',
+    'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats'
+}
+SUPER_ADMIN_ONLY_COMMANDS = {'setchat', 'addadmin', 'removeadmin', 'listadmins'}
 
 
 class SoccerBotV2:
@@ -73,6 +96,151 @@ class SoccerBotV2:
             )
         except Exception as e:
             logger.error(f"Error sending message: {e}")
+
+    def is_super_admin(self, user_id: int) -> bool:
+        return bool(SUPER_ADMIN_ID and user_id == SUPER_ADMIN_ID)
+
+    def is_admin_any_chat(self, user_id: int, username: str = None) -> bool:
+        """Check if a user is admin in any registered chat (for private-command permissions)."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        if user_id:
+            c.execute("SELECT 1 FROM chat_admins WHERE user_id = ? LIMIT 1", (user_id,))
+            if c.fetchone():
+                conn.close()
+                return True
+        if username:
+            clean = username.lstrip('@')
+            c.execute("SELECT 1 FROM chat_admins WHERE LOWER(username) = LOWER(?) LIMIT 1", (clean,))
+            hit = c.fetchone() is not None
+            conn.close()
+            return hit
+        conn.close()
+        return False
+
+    async def refresh_command_scopes(self):
+        """Apply role-based Telegram command menus.
+        - Members: player commands only
+        - Approved admins: player + admin operations
+        - Super admin: all commands (including admin lifecycle)
+        """
+        player_cmds = [
+            BotCommand('wallet', 'View your wallet balance'),
+            BotCommand('topup', 'Add money to your wallet'),
+            BotCommand('cashout', 'Withdraw money to Venmo'),
+            BotCommand('cancel', 'Cancel current flow'),
+        ]
+        admin_ops_cmds = [
+            BotCommand('quickpoll', 'Create a quick poll'),
+            BotCommand('newseason', 'Create a new season'),
+            BotCommand('status', 'Show season status'),
+            BotCommand('testpoll', 'Send a test poll'),
+            BotCommand('cancelgame', 'Cancel a season game'),
+            BotCommand('closepoll', 'Close latest quickpoll'),
+            BotCommand('cancelquickpoll', 'Cancel latest quickpoll'),
+            BotCommand('maketeams', 'Create balanced teams'),
+            BotCommand('addmember', 'Add a season member'),
+            BotCommand('removemember', 'Remove a season member'),
+            BotCommand('addregular', 'Add a regular player'),
+            BotCommand('removeregular', 'Remove a regular player'),
+            BotCommand('members', 'List members and regulars'),
+            BotCommand('setskill', 'Set player skill rating'),
+            BotCommand('skills', 'List all skill ratings'),
+            BotCommand('deleteskill', 'Delete player skill'),
+            BotCommand('viewlate', 'View late arrivals list'),
+            BotCommand('addlate', 'Add late arrivals'),
+            BotCommand('removelate', 'Remove a late arrival'),
+            BotCommand('clearlate', 'Clear late arrivals list'),
+            BotCommand('listchats', 'List groups you manage'),
+        ]
+        super_cmds = [
+            BotCommand('setchat', 'Register or update a group'),
+            BotCommand('addadmin', 'Grant admin access'),
+            BotCommand('removeadmin', 'Revoke admin access'),
+            BotCommand('listadmins', 'List group admins'),
+        ]
+
+        # Baseline visibility: private users see only player commands; groups see none.
+        await self.application.bot.set_my_commands(player_cmds, scope=BotCommandScopeAllPrivateChats())
+        await self.application.bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT value FROM settings WHERE key = 'scoped_admin_users'")
+        old_row = c.fetchone()
+        old_scoped = []
+        if old_row and old_row[0]:
+            try:
+                old_scoped = [int(v) for v in json.loads(old_row[0]) if int(v) > 0]
+            except Exception:
+                old_scoped = []
+
+        c.execute("SELECT DISTINCT user_id FROM chat_admins WHERE user_id IS NOT NULL AND user_id > 0")
+        admin_ids = [r[0] for r in c.fetchall()]
+        conn.close()
+
+        # Revoke stale per-user admin menus.
+        new_scoped_set = set(admin_ids)
+        if SUPER_ADMIN_ID:
+            new_scoped_set.add(SUPER_ADMIN_ID)
+        for uid in old_scoped:
+            if uid not in new_scoped_set:
+                try:
+                    await self.application.bot.set_my_commands(player_cmds, scope=BotCommandScopeChat(chat_id=uid))
+                except Exception as e:
+                    logger.warning(f"Could not clear scoped commands for user {uid}: {e}")
+
+        admin_menu = admin_ops_cmds + player_cmds
+        for uid in admin_ids:
+            if SUPER_ADMIN_ID and uid == SUPER_ADMIN_ID:
+                continue
+            try:
+                await self.application.bot.set_my_commands(admin_menu, scope=BotCommandScopeChat(chat_id=uid))
+            except Exception as e:
+                logger.warning(f"Could not set admin menu for user {uid}: {e}")
+
+        if SUPER_ADMIN_ID:
+            try:
+                await self.application.bot.set_my_commands(
+                    super_cmds + admin_ops_cmds + player_cmds,
+                    scope=BotCommandScopeChat(chat_id=SUPER_ADMIN_ID)
+                )
+            except Exception as e:
+                logger.warning(f"Could not set super-admin menu for {SUPER_ADMIN_ID}: {e}")
+        else:
+            logger.warning("SUPER_ADMIN_ID is not set. Super-admin-only commands remain inaccessible.")
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('scoped_admin_users', ?)",
+                  (json.dumps(sorted(list(new_scoped_set))),))
+        conn.commit()
+        conn.close()
+
+    async def private_command_guard(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Central gate for private commands based on role and command type."""
+        if update.effective_chat.type != 'private' or not update.message or not update.message.text:
+            return
+        if not update.message.text.startswith('/'):
+            return
+
+        cmd = update.message.text.split()[0].split('@')[0].lstrip('/').lower()
+        if not cmd:
+            return
+
+        user = update.effective_user
+        role = 'member'
+        if self.is_super_admin(user.id):
+            role = 'super'
+        elif self.is_admin_any_chat(user.id, user.username):
+            role = 'admin'
+
+        if cmd in SUPER_ADMIN_ONLY_COMMANDS and role != 'super':
+            await self.send(update, "❌ Not allowed.")
+            raise ApplicationHandlerStop
+        if cmd in ADMIN_COMMANDS and role not in ('super', 'admin'):
+            await self.send(update, "❌ Not allowed.")
+            raise ApplicationHandlerStop
 
     def init_database(self):
         conn = sqlite3.connect(DB_FILE)
@@ -1346,9 +1514,8 @@ Miss it = Miss the game. No exceptions."""
 
     async def addadmin_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Add an admin for the current chat: /addadmin @username or /addadmin user_id"""
-        # Check admin authorization - must be existing admin to add new admins
-        is_admin, current_chat_id = await self.check_admin(update)
-        if not is_admin and current_chat_id is not None:  # Allow if no chat set yet (first admin)
+        # Super-admin only: admin lifecycle is centrally controlled.
+        if not self.is_super_admin(update.effective_user.id):
             await self.send(update, "❌ You are not authorized to use this command.")
             return
         
@@ -1384,15 +1551,15 @@ Miss it = Miss the game. No exceptions."""
                   (chat_id, new_admin_id, username))
         conn.commit()
         conn.close()
+        await self.refresh_command_scopes()
         
         safe_username = username.replace('_', '\\_')
         await self.send(update, f"✅ Added admin: {safe_username} for chat {chat_id}")
 
     async def removeadmin_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Remove an admin from the current chat: /removeadmin @username or /removeadmin user_id"""
-        # Check admin authorization
-        is_admin, _ = await self.check_admin(update)
-        if not is_admin:
+        # Super-admin only: admin lifecycle is centrally controlled.
+        if not self.is_super_admin(update.effective_user.id):
             await self.send(update, "❌ You are not authorized to use this command.")
             return
         
@@ -1422,15 +1589,15 @@ Miss it = Miss the game. No exceptions."""
         
         conn.commit()
         conn.close()
+        await self.refresh_command_scopes()
         
         safe_arg = arg.replace('_', '\\_')
         await self.send(update, f"✅ Removed admin: {safe_arg}")
 
     async def listadmins_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """List all admins for the current chat"""
-        # Check admin authorization
-        is_admin, _ = await self.check_admin(update)
-        if not is_admin:
+        # Super-admin only.
+        if not self.is_super_admin(update.effective_user.id):
             await self.send(update, "❌ You are not authorized to use this command.")
             return
         
@@ -1816,6 +1983,11 @@ Miss it = Miss the game. No exceptions."""
         """Set the target chat for polls. 
         - In group: captures chat ID, deletes command instantly, confirms via DM
         - In private: requires manual chat ID as argument"""
+        if not self.is_super_admin(update.effective_user.id):
+            # In groups keep bot behavior silent after command deletion.
+            if update.effective_chat.type == 'private':
+                await self.send(update, "❌ You are not authorized to use this command.")
+            return
         
         user_id = update.effective_user.id
         username = update.effective_user.username or update.effective_user.first_name
@@ -1838,10 +2010,6 @@ Miss it = Miss the game. No exceptions."""
             # Store in chat_groups table
             c.execute("INSERT OR REPLACE INTO chat_groups (chat_id, group_name) VALUES (?, ?)",
                       (chat_id, group_name))
-            
-            # Auto-add this user as admin
-            c.execute("INSERT OR REPLACE INTO chat_admins (chat_id, user_id, username) VALUES (?, ?, ?)",
-                      (chat_id, user_id, username))
             conn.commit()
             conn.close()
             
@@ -1852,7 +2020,7 @@ Miss it = Miss the game. No exceptions."""
             try:
                 await self.application.bot.send_message(
                     chat_id=user_id,
-                    text=f"✅ Group '{group_name_escaped}' registered\!\\n📱 ID: `{chat_id}`\\n🔐 You've been added as admin",
+                    text=f"✅ Group '{group_name_escaped}' registered\!\\n📱 ID: `{chat_id}`\\n💡 Ask the owner to run /addadmin to give you access",
                     parse_mode='MarkdownV2'
                 )
             except Exception as e:
@@ -1864,7 +2032,7 @@ Miss it = Miss the game. No exceptions."""
             # 2. /setchat <chat_id> <group_name> (sets remote group)
             
             if not context.args:
-                await self.send(update, "Usage:\n1. /setchat <GroupName> (to register THIS chat)\n2. /setchat <chat_id> <group_name> (to register a remote group)")
+                await self.send(update, "Usage:\n/setchat <chat_id> <GroupName>")
                 conn.close()
                 return
 
@@ -1884,19 +2052,11 @@ Miss it = Miss the game. No exceptions."""
             # Store in chat_groups table
             c.execute("INSERT OR REPLACE INTO chat_groups (chat_id, group_name) VALUES (?, ?)",
                       (chat_id, group_name))
-            
-            # Auto-add this user as admin
-            c.execute("INSERT OR REPLACE INTO chat_admins (chat_id, user_id, username) VALUES (?, ?, ?)",
-                      (chat_id, user_id, username))
             conn.commit()
             conn.close()
             
             group_name_escaped = self.escape_markdown(group_name)
-            await self.application.bot.send_message(
-                chat_id=user_id,
-                text=f"✅ Group '{group_name_escaped}' registered\!\n📱 ID: `{chat_id}`\n🔐 You've been added as admin",
-                parse_mode='MarkdownV2'
-            )
+            await self.send(update, f"✅ Group '{group_name_escaped}' registered\n📱 ID: `{chat_id}`\n💡 Ask the owner to run /addadmin to give you access")
 
 
     async def status_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2767,6 +2927,7 @@ Miss it = Miss the game. No exceptions."""
     async def on_startup(self, application):
         """Post-init hook: process pending events and start background checker"""
         logger.info("Bot starting up, processing pending events...")
+        await self.refresh_command_scopes()
         await self.process_pending_events()
         asyncio.create_task(self.periodic_event_check())
         logger.info("Bot startup complete.")
@@ -2950,6 +3111,12 @@ Miss it = Miss the game. No exceptions."""
         self.application.add_handler(MessageHandler(
             filters.ChatType.GROUPS & filters.Regex(r'^/'),
             self.delete_group_commands
+        ), group=-1)
+
+        # Private command authorization guard before command handlers.
+        self.application.add_handler(MessageHandler(
+            filters.ChatType.PRIVATE & filters.COMMAND,
+            self.private_command_guard
         ), group=-1)
         
         season_handler = ConversationHandler(
