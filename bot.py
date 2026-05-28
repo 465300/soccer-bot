@@ -25,6 +25,7 @@ from telegram.ext import (
     ContextTypes,
     PicklePersistence,
     ApplicationHandlerStop,
+    ChatMemberHandler,
     filters,
 )
 import sqlite3
@@ -75,7 +76,7 @@ PLAYER_COMMANDS = {'wallet', 'topup', 'cashout', 'cancel'}
 ADMIN_COMMANDS = {
     'quickpoll', 'cancelquickpoll', 'closepoll', 'maketeams',
     'setskill', 'skills', 'deleteskill',
-    'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats', 'setchat'
+    'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats'
 }
 SUPER_ADMIN_ONLY_COMMANDS = {'addadmin', 'removeadmin', 'listadmins'}
 
@@ -146,7 +147,6 @@ class SoccerBotV2:
             BotCommand('removelate', 'Undo a late mark — /removelate poll_id username'),
             BotCommand('clearlate', 'Clear all late flags for a poll — /clearlate poll_id'),
             BotCommand('listchats', 'See all the groups you manage'),
-            BotCommand('setchat', 'Register a group with the bot (run inside the group)'),
         ]
         super_cmds = [
             BotCommand('addadmin', 'Give someone admin access — /addadmin @username'),
@@ -1119,14 +1119,14 @@ class SoccerBotV2:
         
         if not chat_result:
             conn.close()
-            await self.send(update, "❌ No chat set. Use /setchat first.")
+            await self.send(update, "❌ No chat set. Add the bot to a group first.")
             return
         
         chat_id = int(chat_result[0])
 
         if chat_id > 0:
             conn.close()
-            await self.send(update, "❌ No valid group chat set. Run /setchat from inside the group first.")
+            await self.send(update, "❌ No valid group chat set. Add the bot to a group first.")
             return
 
         arg = context.args[0].lstrip('@')
@@ -1168,7 +1168,7 @@ class SoccerBotV2:
         
         if not chat_result:
             conn.close()
-            await self.send(update, "❌ No chat set. Use /setchat first.")
+            await self.send(update, "❌ No chat set. Add the bot to a group first.")
             return
         
         chat_id = int(chat_result[0])
@@ -1202,7 +1202,7 @@ class SoccerBotV2:
         
         if not chat_result:
             conn.close()
-            await self.send(update, "❌ No chat set. Use /setchat first.")
+            await self.send(update, "❌ No chat set. Add the bot to a group first.")
             return
         
         chat_id = int(chat_result[0])
@@ -1239,7 +1239,7 @@ class SoccerBotV2:
         conn.close()
         
         if not groups:
-            await self.send(update, "📋 You're not admin for any groups yet.\n\nUse /setchat in a group to get started!")
+            await self.send(update, "📋 You're not admin for any groups yet. Add the bot to a group to get started.")
             return
         
         text = f"*📋 Your Groups ({len(groups)}):*\n\n"
@@ -1528,7 +1528,7 @@ class SoccerBotV2:
         conn.close()
         
         if not chat_result:
-            await self.send(update, "❌ No chat set. Use /setchat in your group first.")
+            await self.send(update, "❌ No chat set. Add the bot to a group first.")
             return
         
         chat_id = int(chat_result[0])
@@ -1573,85 +1573,66 @@ class SoccerBotV2:
             text = text.replace(char, f"\\{char}")
         return text
 
-    async def set_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Set the target chat for polls. 
-        - In group: captures chat ID, deletes command instantly, confirms via DM
-        - In private: requires manual chat ID as argument"""
-        user = update.effective_user
-        # Super admin can always use; other admins can register groups from group context
-        if not self.is_super_admin(user.id) and not self.is_admin_any_chat(user.id, user.username):
-            if update.effective_chat.type == 'private':
-                await self.send(update, "❌ Not allowed.")
+    async def handle_bot_added_to_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Fires when the bot's membership status changes in a chat.
+        Auto-registers the group when the bot is added."""
+        result = update.my_chat_member
+        if not result:
             return
-        
-        user_id = update.effective_user.id
-        username = update.effective_user.username or update.effective_user.first_name
-        chat_type = update.effective_chat.type
-        
+        new_status = result.new_chat_member.status
+        if new_status not in ('member', 'administrator'):
+            return
+        chat = result.chat
+        if chat.type not in ('group', 'supergroup'):
+            return
+
+        chat_id = chat.id
+        group_name = chat.title or f"Group{abs(chat_id) % 10000}"
+
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        
-        if chat_type in ['group', 'supergroup']:
-            # Group mode: /setchat GroupName
-            chat_id = update.effective_chat.id
-            message_id = update.message.message_id
-            
-            # Get group name from args or use chat title
-            if context.args:
-                group_name = context.args[0]
-            else:
-                group_name = update.effective_chat.title or f"Group{abs(chat_id) % 10000}"
-            
-            # Store in chat_groups table
-            c.execute("INSERT OR REPLACE INTO chat_groups (chat_id, group_name) VALUES (?, ?)",
-                      (chat_id, group_name))
-            conn.commit()
-            conn.close()
-            
-            # Note: The command message is deleted by the global delete_group_commands handler.
-            
-            # Send confirmation to user's private DM
-            group_name_escaped = self.escape_markdown(group_name)
+        c.execute("INSERT OR REPLACE INTO chat_groups (chat_id, group_name) VALUES (?, ?)",
+                  (chat_id, group_name))
+        conn.commit()
+        conn.close()
+
+        # DM the super-admin
+        if SUPER_ADMIN_ID:
             try:
-                await self.application.bot.send_message(
-                    chat_id=user_id,
-                    text=f"✅ Group '{group_name_escaped}' registered\!\n📱 ID: `{chat_id}`",
-                    parse_mode='MarkdownV2'
+                await context.bot.send_message(
+                    chat_id=SUPER_ADMIN_ID,
+                    text=f"✅ Auto-registered group *{self.escape_markdown(group_name)}* (`{chat_id}`)",
+                    parse_mode='Markdown'
                 )
             except Exception as e:
-                logger.warning(f"Could not DM user {user_id}: {e}")
-        
-        else:
-            # Private chat mode: 
-            # 1. /setchat GroupName (uses current DM as target)
-            # 2. /setchat <chat_id> <group_name> (sets remote group)
-            
-            if not context.args:
-                await self.send(update, "Usage:\n/setchat <chat_id> <GroupName>")
-                conn.close()
-                return
+                logger.warning(f"Could not DM super-admin on group join: {e}")
 
-            if len(context.args) == 1:
-                # Use current private chat as the target (good for testing)
-                chat_id = update.effective_chat.id
-                group_name = context.args[0]
-            else:
-                try:
-                    chat_id = int(context.args[0])
-                    group_name = context.args[1]
-                except (ValueError, IndexError):
-                    await self.send(update, "Invalid format. Usage: /setchat <chat_id> <group_name>")
-                    conn.close()
-                    return
-            
-            # Store in chat_groups table
-            c.execute("INSERT OR REPLACE INTO chat_groups (chat_id, group_name) VALUES (?, ?)",
-                      (chat_id, group_name))
-            conn.commit()
-            conn.close()
-            
-            group_name_escaped = self.escape_markdown(group_name)
-            await self.send(update, f"✅ Group '{group_name_escaped}' registered\n📱 ID: `{chat_id}`")
+    async def set_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Super-admin escape hatch: /setchat <chat_id> <GroupName>"""
+        if not self.is_super_admin(update.effective_user.id):
+            await self.send(update, "❌ Not allowed.")
+            return
+
+        if not context.args or len(context.args) < 2:
+            await self.send(update, "Usage: /setchat <chat_id> <GroupName>")
+            return
+
+        try:
+            chat_id = int(context.args[0])
+            group_name = ' '.join(context.args[1:])
+        except ValueError:
+            await self.send(update, "Invalid chat_id. Usage: /setchat <chat_id> <GroupName>")
+            return
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO chat_groups (chat_id, group_name) VALUES (?, ?)",
+                  (chat_id, group_name))
+        conn.commit()
+        conn.close()
+
+        group_name_escaped = self.escape_markdown(group_name)
+        await self.send(update, f"✅ Group '{group_name_escaped}' registered\n📱 ID: `{chat_id}`")
 
 
     # ===== QUICK POLL (no season required) =====
@@ -1681,7 +1662,7 @@ class SoccerBotV2:
         conn.close()
 
         if not groups:
-            await self.send(update, "❌ No groups registered. Run /setchat <chat_id> <GroupName> first.")
+            await self.send(update, "❌ No groups registered yet. Add the bot to a group first.")
             return ConversationHandler.END
 
         # Store groups for next step
@@ -2109,7 +2090,7 @@ class SoccerBotV2:
         if res:
             return int(res[0]), None
             
-        return None, "❌ No chat context found. Use /setchat or specify a group name."
+        return None, "❌ No chat context found. Add the bot to a group first, or specify a group name."
 
     async def handle_late_arrivals_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle admin's response to late arrivals prompt"""
@@ -2827,7 +2808,8 @@ class SoccerBotV2:
 
         # Standalone commands
         self.application.add_handler(CommandHandler('start', self.start_cmd, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('setchat', self.set_chat))  # Works in both group and private
+        self.application.add_handler(CommandHandler('setchat', self.set_chat, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(ChatMemberHandler(self.handle_bot_added_to_group, ChatMemberHandler.MY_CHAT_MEMBER))
         self.application.add_handler(CommandHandler('addadmin', self.addadmin_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('removeadmin', self.removeadmin_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('listadmins', self.listadmins_cmd, filters=filters.ChatType.PRIVATE))
