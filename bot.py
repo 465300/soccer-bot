@@ -129,6 +129,7 @@ class SoccerBotV2:
         - Super admin: all commands (including admin lifecycle)
         """
         player_cmds = [
+            BotCommand('start', 'Get started / see what I can do'),
             BotCommand('wallet', 'Check your balance and recent activity'),
             BotCommand('topup', 'Add funds to join games ($10/game)'),
             BotCommand('cashout', 'Withdraw your balance to Venmo'),
