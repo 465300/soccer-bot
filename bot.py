@@ -2702,14 +2702,37 @@ class SoccerBotV2:
             role = 'player'
 
         greeting = "سلام گل گلاب\! بذار بهت بگم چطوری میتونم در خدمتت باشم 🙌\n\n"
-        if role in ('admin', 'super'):
+        if role == 'super':
             body = (
-                "🗳 /quickpoll — Create a game poll for your group\. I'll collect votes, charge $10 per player, and handle refunds automatically\.\n"
-                "✅ /closepoll — Close voting early and send the final lineup for your approval\.\n"
-                "❌ /cancelquickpoll — Cancel a poll and refund everyone automatically\.\n"
-                "⚽ /maketeams — Split voted\-in players into balanced teams based on skill ratings\.\n"
-                "⭐ /setskill, /skills, /deleteskill — Manage skill ratings for fair team splits\.\n"
-                "💰 /wallet, /topup, /cashout — Your own wallet: check balance, add funds, or withdraw\.\n\n"
+                "*👑 Group Management:*\n"
+                "/addadmin — Give someone admin access\n"
+                "/removeadmin — Revoke admin access\n"
+                "/listadmins — See all admins for a group\n"
+                "/listchats — See all groups you manage\n\n"
+                "*🗳 Game Operations:*\n"
+                "/quickpoll — Create a game poll for your group\n"
+                "/closepoll — Close voting early and send the final lineup for approval\n"
+                "/cancelquickpoll — Cancel a poll and refund everyone automatically\n"
+                "/maketeams — Split voted\-in players into balanced teams\n"
+                "/setskill, /skills, /deleteskill — Manage skill ratings for fair team splits\n\n"
+                "*💰 Your Wallet:*\n"
+                "/wallet — Check your balance and recent activity\n"
+                "/topup — Add funds to join games\n"
+                "/cashout — Withdraw to Venmo\n\n"
+                "Just send /quickpoll to get started\."
+            )
+        elif role == 'admin':
+            body = (
+                "*🗳 Game Operations:*\n"
+                "/quickpoll — Create a game poll for your group\n"
+                "/closepoll — Close voting early and send the final lineup for approval\n"
+                "/cancelquickpoll — Cancel a poll and refund everyone automatically\n"
+                "/maketeams — Split voted\-in players into balanced teams\n"
+                "/setskill, /skills, /deleteskill — Manage skill ratings for fair team splits\n\n"
+                "*💰 Your Wallet:*\n"
+                "/wallet — Check your balance and recent activity\n"
+                "/topup — Add funds to join games\n"
+                "/cashout — Withdraw to Venmo\n\n"
                 "Just send /quickpoll to get started\."
             )
         else:
