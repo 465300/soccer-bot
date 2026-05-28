@@ -38,7 +38,7 @@ WEBHOOK_PORT = int(os.getenv('PORT', '8080'))
 LOCATION_NAME, LOCATION_LINK, GAME_DAY, GAME_TIME_START, GAME_TIME_END, START_DATE, DURATION, MAX_PLAYERS = range(8)
 
 # States for quickpoll conversation
-QP_CHOOSE_TYPE, QP_LOCATION_NAME, QP_LOCATION_LINK, QP_DATE, QP_TIME_START, QP_TIME_END, QP_MAX_PLAYERS, QP_DEADLINE, QP_AUTO_TEAMS, QP_NUM_TEAMS = range(100, 110)
+QP_GROUP_SELECT, QP_LOCATION_NAME, QP_LOCATION_LINK, QP_DATE, QP_TIME_START, QP_TIME_END, QP_MAX_PLAYERS, QP_DEADLINE, QP_AUTO_TEAMS, QP_NUM_TEAMS = range(100, 111)
 
 # States for late arrivals input
 AWAITING_LATE_ARRIVALS_INPUT = 110
@@ -1953,32 +1953,74 @@ Miss it = Miss the game. No exceptions."""
         context.user_data['qp'] = {}
         context.user_data['qp']['admin_id'] = update.effective_user.id
 
-        await self.send(update, "⚡ *Quick Poll Setup*\n\nStep 1/8: Enter *location name*:", parse_mode='Markdown')
+        # Get list of groups this admin manages
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            SELECT DISTINCT cg.chat_id, cg.group_name
+            FROM chat_admins ca
+            JOIN chat_groups cg ON ca.chat_id = cg.chat_id
+            WHERE ca.user_id = ?
+            ORDER BY cg.group_name
+        """, (update.effective_user.id,))
+        groups = c.fetchall()
+        conn.close()
+
+        if not groups:
+            await self.send(update, "❌ No groups registered. Run /setchat <chat_id> <GroupName> first.")
+            return ConversationHandler.END
+
+        # Store groups for next step
+        context.user_data['qp']['available_groups'] = groups
+
+        # Ask user to pick a group
+        group_list = "\n".join([f"{i+1}. {name}" for i, (_, name) in enumerate(groups)])
+        await self.send(update, f"⚡ *Quick Poll Setup*\n\nStep 1/10: Which group?\n\n{group_list}\n\nReply with the *number*:", parse_mode='Markdown')
+        return QP_GROUP_SELECT
+
+    async def qp_get_group_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Get group selection from user"""
+        try:
+            choice = int(update.message.text.strip()) - 1
+            groups = context.user_data['qp']['available_groups']
+            if choice < 0 or choice >= len(groups):
+                await self.send(update, f"❌ Invalid choice. Pick 1–{len(groups)}.")
+                return QP_GROUP_SELECT
+            
+            selected_chat_id, selected_name = groups[choice]
+            context.user_data['qp']['target_chat_id'] = selected_chat_id
+            context.user_data['qp']['target_group_name'] = selected_name
+            
+        except ValueError:
+            await self.send(update, "❌ Please enter a valid number.")
+            return QP_GROUP_SELECT
+
+        await self.send(update, "✅ Step 2/10: Enter *location name*:", parse_mode='Markdown')
         return QP_LOCATION_NAME
 
     async def qp_get_location_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['qp']['location_name'] = update.message.text
-        await self.send(update, "Step 2/8: Enter *Google Maps link*:")
+        await self.send(update, "✅ Step 3/10: Enter *Google Maps link*:")
         return QP_LOCATION_LINK
 
     async def qp_get_location_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['qp']['location_link'] = update.message.text
-        await self.send(update, "Step 3/8: Enter *game date* (e.g., Feb 10 or 2026-02-10):")
+        await self.send(update, "✅ Step 4/10: Enter *game date* (YYYY-MM-DD):")
         return QP_DATE
 
     async def qp_get_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['qp']['date'] = update.message.text.strip()
-        await self.send(update, "Step 4/8: Enter *start time* (e.g., 7:00 PM):")
+        await self.send(update, "✅ Step 5/10: Enter *start time* (HH:MM):")
         return QP_TIME_START
 
     async def qp_get_time_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['qp']['time_start'] = update.message.text.strip()
-        await self.send(update, "Step 5/8: Enter *end time* (e.g., 9:00 PM):")
+        await self.send(update, "✅ Step 6/10: Enter *end time* (HH:MM):")
         return QP_TIME_END
 
     async def qp_get_time_end(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['qp']['time_end'] = update.message.text.strip()
-        await self.send(update, "Step 6/8: Enter *max players* (e.g., 15):")
+        await self.send(update, "✅ Step 7/10: Enter *max players* (number):")
         return QP_MAX_PLAYERS
 
     async def qp_get_max_players(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1988,7 +2030,7 @@ Miss it = Miss the game. No exceptions."""
             await self.send(update, "Please enter a number:")
             return QP_MAX_PLAYERS
         context.user_data['qp']['max_players'] = max_players
-        await self.send(update, "Step 7/8: Enter *voting deadline* in hours (e.g., 2), or *skip* for no deadline:")
+        await self.send(update, "✅ Step 8/10: Enter *voting deadline* in hours (e.g., 2), or *skip* for no deadline:")
         return QP_DEADLINE
 
     async def qp_get_deadline(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2004,7 +2046,7 @@ Miss it = Miss the game. No exceptions."""
             await self.send(update, "Please enter a number of hours, or *skip* for no deadline:")
             return QP_DEADLINE
         context.user_data['qp']['deadline_hours'] = hours
-        await self.send(update, "Step 8: Auto-create teams when voting closes? (*yes* or *no*):")
+        await self.send(update, "✅ Step 9/10: Auto-create teams when voting closes? (*yes* or *no*):")
         return QP_AUTO_TEAMS
 
     async def qp_get_auto_teams(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2031,44 +2073,19 @@ Miss it = Miss the game. No exceptions."""
             return QP_NUM_TEAMS
         
         context.user_data['qp']['num_teams'] = num_teams
+        await self.send(update, "✅ Step 10/10: Sending poll...")
         return await self._send_quickpoll_final(update, context)
 
     async def _send_quickpoll_final(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Shared logic to send quickpoll and optionally schedule teams"""
         qp = context.user_data['qp']
         
-        # Get the registered chat for this admin
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
+        # Use the target_chat_id selected in the wizard
+        chat_id = qp.get('target_chat_id')
         
-        # Priority 1: Check chat_admins/chat_groups for this user
-        # We need to find which chat this user is currently managing/set context for.
-        # For now, since we only support 1 active chat per admin in this flow, we'll pick the most recently added or updated.
-        c.execute("""
-            SELECT ca.chat_id, cg.group_name 
-            FROM chat_admins ca
-            JOIN chat_groups cg ON ca.chat_id = cg.chat_id
-            WHERE ca.user_id = ?
-            ORDER BY ca.added_at DESC
-            LIMIT 1
-        """, (qp['admin_id'],))
-        
-        chat_result = c.fetchone()
-        
-        # Fallback to legacy settings if nothing found (backward compatibility)
-        if not chat_result:
-             c.execute("SELECT value FROM settings WHERE key = 'chat_id'")
-             legacy_res = c.fetchone()
-             if legacy_res:
-                 chat_result = (int(legacy_res[0]), "Legacy Group")
-
-        conn.close()
-
-        if not chat_result:
-            await self.send(update, "❌ No chat set. Use /setchat in your group (or /setchat <Name> here) first.")
+        if not chat_id:
+            await self.send(update, "❌ No group selected. Restart with /quickpoll.")
             return ConversationHandler.END
-
-        chat_id = chat_result[0]
         
         # Calculate deadline time (None if skipped)
         deadline_hours = qp.get('deadline_hours')
@@ -2964,6 +2981,7 @@ Miss it = Miss the game. No exceptions."""
         quickpoll_handler = ConversationHandler(
             entry_points=[CommandHandler('quickpoll', self.quickpoll_start, filters=filters.ChatType.PRIVATE)],
             states={
+                QP_GROUP_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_group_select)],
                 QP_LOCATION_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_location_name)],
                 QP_LOCATION_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_location_link)],
                 QP_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_date)],
