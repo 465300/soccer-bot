@@ -2703,7 +2703,6 @@ class SoccerBotV2:
         greeting = "سلام گل گلاب\! بذار بهت بگم چطوری میتونم در خدمتت باشم 🙌\n\n"
         if role in ('admin', 'super'):
             body = (
-                "Here's what I can do for you:\n\n"
                 "🗳 /quickpoll — Create a game poll for your group\. I'll collect votes, charge $10 per player, and handle refunds automatically\.\n"
                 "✅ /closepoll — Close voting early and send the final lineup for your approval\.\n"
                 "❌ /cancelquickpoll — Cancel a poll and refund everyone automatically\.\n"
@@ -2714,7 +2713,6 @@ class SoccerBotV2:
             )
         else:
             body = (
-                "Here's what I can do for you:\n\n"
                 "💰 /wallet — Check your balance and recent game activity\.\n"
                 "💳 /topup — Add funds to your wallet so you can vote in on games\. Each game costs $10\.\n"
                 "💸 /cashout — Withdraw your balance back to Venmo anytime\.\n\n"
