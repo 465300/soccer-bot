@@ -44,17 +44,21 @@ WEBHOOK_URL = os.getenv('WEBHOOK_URL', f"https://{os.getenv('FLY_APP_NAME', 'soc
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '')
 WEBHOOK_PORT = int(os.getenv('PORT', '8080'))
 
-LOCATION_NAME, LOCATION_LINK, GAME_DAY, GAME_TIME_START, GAME_TIME_END, START_DATE, DURATION, MAX_PLAYERS = range(8)
-
 # States for quickpoll conversation
 QP_GROUP_SELECT, QP_LOCATION_NAME, QP_LOCATION_LINK, QP_DATE, QP_TIME_START, QP_TIME_END, QP_MAX_PLAYERS, QP_DEADLINE, QP_AUTO_TEAMS, QP_NUM_TEAMS = range(100, 110)
 
 # States for late arrivals input
 AWAITING_LATE_ARRIVALS_INPUT = 110
 
+# Pre-fill check state for quickpoll repeat
+QP_REPEAT_CHECK = 111
+
 # States for wallet conversations (custom top-up amount, cash-out)
 TOPUP_CUSTOM_AMOUNT = 120
 CASHOUT_AMOUNT, CASHOUT_HANDLE = 121, 122
+
+# Cancel quickpoll with reason
+CANCEL_QP_REASON = 123
 
 # ===== Payment / wallet config =====
 VENMO_HANDLE = '@chico-leo'  # Venmo handle players pay to for top-ups
@@ -69,12 +73,11 @@ SUPER_ADMIN_ID = int(_raw_super_admin_id) if _raw_super_admin_id.isdigit() else 
 # Role-based command routing for private chats
 PLAYER_COMMANDS = {'wallet', 'topup', 'cashout', 'cancel'}
 ADMIN_COMMANDS = {
-    'newseason', 'quickpoll', 'status', 'testpoll', 'cancelgame', 'cancelquickpoll',
-    'closepoll', 'maketeams', 'addmember', 'removemember', 'addregular',
-    'removeregular', 'members', 'setskill', 'skills', 'deleteskill',
-    'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats'
+    'quickpoll', 'cancelquickpoll', 'closepoll', 'maketeams',
+    'setskill', 'skills', 'deleteskill',
+    'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats', 'setchat'
 }
-SUPER_ADMIN_ONLY_COMMANDS = {'setchat', 'addadmin', 'removeadmin', 'listadmins'}
+SUPER_ADMIN_ONLY_COMMANDS = {'addadmin', 'removeadmin', 'listadmins'}
 
 
 class SoccerBotV2:
@@ -125,39 +128,30 @@ class SoccerBotV2:
         - Super admin: all commands (including admin lifecycle)
         """
         player_cmds = [
-            BotCommand('wallet', 'View your wallet balance'),
-            BotCommand('topup', 'Add money to your wallet'),
-            BotCommand('cashout', 'Withdraw money to Venmo'),
-            BotCommand('cancel', 'Cancel current flow'),
+            BotCommand('wallet', 'Check your balance and recent activity'),
+            BotCommand('topup', 'Add funds to join games ($10/game)'),
+            BotCommand('cashout', 'Withdraw your balance to Venmo'),
+            BotCommand('cancel', 'Cancel whatever you\'re doing right now'),
         ]
         admin_ops_cmds = [
-            BotCommand('quickpoll', 'Create a quick poll'),
-            BotCommand('newseason', 'Create a new season'),
-            BotCommand('status', 'Show season status'),
-            BotCommand('testpoll', 'Send a test poll'),
-            BotCommand('cancelgame', 'Cancel a season game'),
-            BotCommand('closepoll', 'Close latest quickpoll'),
-            BotCommand('cancelquickpoll', 'Cancel latest quickpoll'),
-            BotCommand('maketeams', 'Create balanced teams'),
-            BotCommand('addmember', 'Add a season member'),
-            BotCommand('removemember', 'Remove a season member'),
-            BotCommand('addregular', 'Add a regular player'),
-            BotCommand('removeregular', 'Remove a regular player'),
-            BotCommand('members', 'List members and regulars'),
-            BotCommand('setskill', 'Set player skill rating'),
-            BotCommand('skills', 'List all skill ratings'),
-            BotCommand('deleteskill', 'Delete player skill'),
-            BotCommand('viewlate', 'View late arrivals list'),
-            BotCommand('addlate', 'Add late arrivals'),
-            BotCommand('removelate', 'Remove a late arrival'),
-            BotCommand('clearlate', 'Clear late arrivals list'),
-            BotCommand('listchats', 'List groups you manage'),
+            BotCommand('quickpoll', 'Set up a game poll for your group'),
+            BotCommand('closepoll', 'Close voting and post the final player list'),
+            BotCommand('cancelquickpoll', 'Cancel a poll and refund everyone'),
+            BotCommand('maketeams', 'Split players into balanced skill-based teams'),
+            BotCommand('setskill', 'Set a player\'s skill rating — /setskill Name 1-10'),
+            BotCommand('skills', 'See all player skill ratings'),
+            BotCommand('deleteskill', 'Remove a player\'s skill rating'),
+            BotCommand('viewlate', 'See who was marked late for a poll'),
+            BotCommand('addlate', 'Mark a player as late — /addlate poll_id username'),
+            BotCommand('removelate', 'Undo a late mark — /removelate poll_id username'),
+            BotCommand('clearlate', 'Clear all late flags for a poll — /clearlate poll_id'),
+            BotCommand('listchats', 'See all the groups you manage'),
+            BotCommand('setchat', 'Register a group with the bot (run inside the group)'),
         ]
         super_cmds = [
-            BotCommand('setchat', 'Register or update a group'),
-            BotCommand('addadmin', 'Grant admin access'),
-            BotCommand('removeadmin', 'Revoke admin access'),
-            BotCommand('listadmins', 'List group admins'),
+            BotCommand('addadmin', 'Give someone admin access — /addadmin @username'),
+            BotCommand('removeadmin', 'Revoke admin access — /removeadmin @username'),
+            BotCommand('listadmins', 'See all admins for a group'),
         ]
 
         # Baseline visibility: private users see only player commands; groups see none.
@@ -352,6 +346,15 @@ class SoccerBotV2:
             c.execute("ALTER TABLE quickpolls ADD COLUMN time_start TEXT")
         except:
             pass
+        # Quickpoll pre-fill: store location_link and time_end for repeat use
+        try:
+            c.execute("ALTER TABLE quickpolls ADD COLUMN location_link TEXT")
+        except:
+            pass
+        try:
+            c.execute("ALTER TABLE quickpolls ADD COLUMN time_end TEXT")
+        except:
+            pass
         # Add member_type column for regular/drop-in players
         try:
             c.execute("ALTER TABLE members ADD COLUMN member_type TEXT DEFAULT 'member'")
@@ -403,6 +406,17 @@ class SoccerBotV2:
             notes TEXT)''')
         conn.commit()
         conn.close()
+
+        # Drop legacy season tables (season feature removed)
+        conn2 = sqlite3.connect(DB_FILE)
+        c2 = conn2.cursor()
+        for tbl in ('votes', 'polls', 'members', 'season'):
+            try:
+                c2.execute(f"DROP TABLE IF EXISTS {tbl}")
+            except Exception:
+                pass
+        conn2.commit()
+        conn2.close()
 
     def is_admin(self, user_id: int, chat_id: int, username: str = None) -> bool:
         """Check if user is an admin for the specified chat (by user_id or username).
@@ -932,289 +946,6 @@ class SoccerBotV2:
         except Exception as e:
             logger.warning(f"Could not close quickpoll buttons ({message_id}): {e}")
 
-    async def newseason_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['admin_id'] = update.effective_user.id
-        context.user_data['setup_chat_id'] = update.effective_chat.id  # Remember which chat started setup
-        logger.info(f"newseason started by user {update.effective_user.id} in chat {update.effective_chat.id}")
-        await self.send(update, "🏟️ *New Season Setup*\n\nStep 1/8: Enter *location name*:")
-        return LOCATION_NAME
-
-    async def get_location_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logger.info(f"get_location_name called by user {update.effective_user.id}: {update.message.text}")
-        context.user_data['location_name'] = update.message.text
-        await self.send(update, "Step 2/8: Enter *Google Maps link*:")
-        return LOCATION_LINK
-
-    async def get_location_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['location_link'] = update.message.text
-        await self.send(update, "Step 3/8: Enter *game day* (e.g., Thursday):")
-        return GAME_DAY
-
-    async def get_game_day(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        day = update.message.text.strip().capitalize()
-        valid_days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        if day not in valid_days:
-            await self.send(update, f"Invalid day. Choose: {', '.join(valid_days)}")
-            return GAME_DAY
-        context.user_data['game_day'] = day
-        await self.send(update, "Step 4/8: Enter *start time* (e.g., 19:00):")
-        return GAME_TIME_START
-
-    async def get_time_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['start_time'] = update.message.text.strip()
-        await self.send(update, "Step 5/8: Enter *end time* (e.g., 21:00):")
-        return GAME_TIME_END
-
-    async def get_time_end(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['end_time'] = update.message.text.strip()
-        await self.send(update, "Step 6/8: Enter *first game date* (YYYY-MM-DD):")
-        return START_DATE
-
-    async def get_start_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            datetime.strptime(update.message.text.strip(), '%Y-%m-%d')
-            context.user_data['start_date'] = update.message.text.strip()
-        except ValueError:
-            await self.send(update, "Invalid format. Use YYYY-MM-DD:")
-            return START_DATE
-        await self.send(update, "Step 7/8: Enter *duration in weeks* (e.g., 10):")
-        return DURATION
-
-    async def get_duration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            context.user_data['duration'] = int(update.message.text.strip())
-        except ValueError:
-            await self.send(update, "Enter a number:")
-            return DURATION
-        await self.send(update, "Step 8/8: Enter *max players* (e.g., 15):")
-        return MAX_PLAYERS
-
-    async def get_max_players(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            context.user_data['max_players'] = int(update.message.text.strip())
-        except ValueError:
-            await self.send(update, "Enter a number:")
-            return MAX_PLAYERS
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("UPDATE season SET active = 0")
-        c.execute("UPDATE scheduled_events SET executed = 1 WHERE executed = 0 AND event_type IN ('send_poll', 'update_countdown', 'send_reminder', 'close_poll')")
-        c.execute('''INSERT INTO season (location_name, location_link, game_day, start_time, end_time, 
-                     start_date, duration_weeks, max_players) VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (context.user_data['location_name'], context.user_data['location_link'],
-                   context.user_data['game_day'], context.user_data['start_time'], context.user_data['end_time'],
-                   context.user_data['start_date'], context.user_data['duration'], context.user_data['max_players']))
-        season_id = c.lastrowid
-        conn.commit()
-        conn.close()
-
-        self.schedule_season_polls(season_id)
-        
-        summary = f"""✅ *Season Created!*
-📍 {context.user_data['location_name']}
-🗓️ Every {context.user_data['game_day']}
-🕐 {context.user_data['start_time']} - {context.user_data['end_time']}
-📅 Starts: {context.user_data['start_date']}
-⏳ Duration: {context.user_data['duration']} weeks
-👥 Max: {context.user_data['max_players']} players
-
-Polls sent 3 days before each game at noon."""
-        await self.send(update, summary)
-        return ConversationHandler.END
-
-    async def cancel_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self.send(update, "Setup cancelled.")
-        return ConversationHandler.END
-
-    def schedule_season_polls(self, season_id: int):
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM season WHERE id = ?", (season_id,))
-        season = c.fetchone()
-        c.execute("SELECT value FROM settings WHERE key = 'chat_id'")
-        chat_result = c.fetchone()
-        conn.close()
-
-        if not season or not chat_result:
-            return
-
-        chat_id = int(chat_result[0])
-        start_date = datetime.strptime(season[6], '%Y-%m-%d')
-        duration = season[7]
-
-        for week in range(duration):
-            game_date = start_date + timedelta(weeks=week)
-            poll_date = game_date - timedelta(days=3)
-            poll_date = poll_date.replace(hour=12, minute=0, second=0)
-            
-            if TZ.localize(poll_date) > datetime.now(TZ):
-                self.schedule_event('send_poll', TZ.localize(poll_date), {
-                    'season_id': season_id, 'week': week + 1,
-                    'game_date': game_date.strftime('%Y-%m-%d'), 'chat_id': chat_id
-                })
-
-    async def send_poll(self, season_id: int, week: int, game_date: str, chat_id: int):
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM season WHERE id = ?", (season_id,))
-        season = c.fetchone()
-        conn.close()
-
-        if not season or not season[10]:
-            return
-
-        location_name, location_link = season[1], season[2]
-        start_time, end_time = season[4], season[5]
-        duration_weeks, max_players = season[7], season[8]
-
-        now = datetime.now(TZ)
-        deadline = now + timedelta(hours=48)
-        deadline_str = deadline.strftime('%a %b %d at %I:%M %p')
-
-        keyboard = [
-            [InlineKeyboardButton("✅ IN (Members)", callback_data=f"vote_{season_id}_{week}_member_in")],
-            [InlineKeyboardButton("❌ OUT (Members)", callback_data=f"vote_{season_id}_{week}_member_out")],
-            [InlineKeyboardButton("👥 Guest", callback_data=f"vote_{season_id}_{week}_guest")],
-            [InlineKeyboardButton("📊 Status", callback_data=f"status_{season_id}_{week}")],
-        ]
-
-        game_dt = datetime.strptime(game_date, '%Y-%m-%d')
-        msg = f"""⚽ *Soccer @ {location_name}*
-📍 [Click for directions]({location_link})
-🗓️ {game_dt.strftime('%A %b %d')} | {start_time} - {end_time}
-👥 Max: {max_players} | Week {week} of {duration_weeks}
-
-📢 Voting closes: {deadline_str}
-⏳ ~48 hours remaining
-Miss it = Miss the game. No exceptions."""
-
-        poll_msg = await self.application.bot.send_message(
-            chat_id=chat_id, text=msg, reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown', disable_web_page_preview=True
-        )
-
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('INSERT INTO polls (season_id, week_number, game_date, message_id, chat_id, deadline) VALUES (?, ?, ?, ?, ?, ?)',
-                  (season_id, week, game_date, poll_msg.message_id, chat_id, deadline.isoformat()))
-        poll_id = c.lastrowid
-        c.execute("UPDATE season SET current_week = ? WHERE id = ?", (week, season_id))
-        conn.commit()
-        conn.close()
-
-        self.schedule_poll_updates(poll_id, deadline, chat_id, poll_msg.message_id, season_id, week)
-
-    def schedule_poll_updates(self, poll_id: int, deadline: datetime, chat_id: int, msg_id: int, season_id: int, week: int):
-        now = datetime.now(TZ)
-        for hours in [24, 12, 6, 2, 1]:
-            update_time = deadline - timedelta(hours=hours)
-            if update_time > now:
-                self.schedule_event('update_countdown', TZ.localize(update_time), {
-                    'poll_id': poll_id, 'msg_id': msg_id, 'chat_id': chat_id,
-                    'hours_left': hours, 'season_id': season_id, 'week': week
-                })
-        
-        reminder_time = deadline - timedelta(hours=12)
-        if reminder_time > now:
-            self.schedule_event('send_reminder', TZ.localize(reminder_time), {
-                'poll_id': poll_id, 'chat_id': chat_id, 'season_id': season_id, 'week': week
-            })
-        
-        self.schedule_event('close_poll', TZ.localize(deadline), {
-            'poll_id': poll_id, 'chat_id': chat_id, 'season_id': season_id, 'week': week
-        })
-
-    async def update_countdown(self, poll_id: int, msg_id: int, chat_id: int, hours_left: int):
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('SELECT p.*, s.* FROM polls p JOIN season s ON p.season_id = s.id WHERE p.id = ?', (poll_id,))
-        r = c.fetchone()
-        conn.close()
-        if not r: return
-
-        game_date, deadline_str = r[3], r[5]
-        location_name, location_link = r[10], r[11]
-        start_time, end_time = r[13], r[14]
-        duration_weeks, max_players, week = r[16], r[17], r[2]
-        deadline = datetime.fromisoformat(deadline_str)
-        game_dt = datetime.strptime(game_date, '%Y-%m-%d')
-
-        keyboard = [
-            [InlineKeyboardButton("✅ IN (Members)", callback_data=f"vote_{r[1]}_{week}_member_in")],
-            [InlineKeyboardButton("❌ OUT (Members)", callback_data=f"vote_{r[1]}_{week}_member_out")],
-            [InlineKeyboardButton("👥 Guest", callback_data=f"vote_{r[1]}_{week}_guest")],
-            [InlineKeyboardButton("📊 Status", callback_data=f"status_{r[1]}_{week}")],
-        ]
-
-        msg = f"""⚽ *Soccer @ {location_name}*
-📍 [Click for directions]({location_link})
-🗓️ {game_dt.strftime('%A %b %d')} | {start_time} - {end_time}
-👥 Max: {max_players} | Week {week} of {duration_weeks}
-
-📢 Voting closes: {deadline.strftime('%a %b %d at %I:%M %p')}
-⏳ ~{hours_left} hours remaining
-Miss it = Miss the game. No exceptions."""
-
-        try:
-            await self.application.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=msg,
-                reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown', disable_web_page_preview=True)
-        except: pass
-
-    async def send_nonvoter_reminder(self, poll_id: int, chat_id: int):
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT username FROM members")
-        all_members = {r[0].lower() for r in c.fetchall() if r[0]}
-        c.execute("SELECT LOWER(username) FROM votes WHERE poll_id = ?", (poll_id,))
-        voted = {r[0] for r in c.fetchall() if r[0]}
-        conn.close()
-
-        non_voter_names = sorted(all_members - voted)
-        if not non_voter_names:
-            return
-
-        mentions_list = [f"@{name.replace('_', chr(92) + '_')}" for name in non_voter_names]
-        mentions = ' '.join(mentions_list)
-        await self.application.bot.send_message(chat_id=chat_id,
-            text=f"⚠️ *12 hours left!* These members haven't voted:\n{mentions}\n\nVote now or you're out!", parse_mode='Markdown')
-
-    async def close_poll(self, poll_id: int, chat_id: int, season_id: int, week: int):
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("UPDATE polls SET closed = 1 WHERE id = ?", (poll_id,))
-        c.execute('SELECT username, vote_type FROM votes WHERE poll_id = ? ORDER BY voted_at', (poll_id,))
-        votes = c.fetchall()
-        c.execute("SELECT max_players, duration_weeks FROM season WHERE id = ?", (season_id,))
-        season = c.fetchone()
-        conn.commit()
-        conn.close()
-
-        max_players = season[0]
-        members_in = [v[0] for v in votes if v[1] == 'member_in']
-        guests = [v[0] for v in votes if v[1] == 'guest']
-        spots_left = max_players - len(members_in)
-        selected_guests = guests[:spots_left] if spots_left > 0 else []
-
-        msg = f"🏁 *FINAL LIST - Week {week}*\n\n"
-        if members_in:
-            safe_members = [m.replace('_', '\\_') for m in members_in]
-            msg += f"*Members ({len(members_in)}):*\n" + '\n'.join([f"👤 {m}" for m in safe_members]) + "\n\n"
-        if selected_guests:
-            safe_guests = [g.replace('_', '\\_') for g in selected_guests]
-            msg += f"*Guests ({len(selected_guests)}):*\n" + '\n'.join([f"👥 {g}" for g in safe_guests]) + "\n\n"
-        msg += f"*Total: {len(members_in) + len(selected_guests)}/{max_players}*"
-
-        await self.application.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
-        if week >= season[1]: await self.prompt_season_end(chat_id)
-
-    async def prompt_season_end(self, chat_id: int):
-        keyboard = [[InlineKeyboardButton("🔄 Renew", callback_data="season_renew")],
-                    [InlineKeyboardButton("✏️ Modify", callback_data="season_modify")],
-                    [InlineKeyboardButton("⏹️ Stop", callback_data="season_stop")]]
-        await self.application.bot.send_message(chat_id=chat_id, text="🏁 *Season Ended!* What's next?",
-            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
 
@@ -1228,15 +959,7 @@ Miss it = Miss the game. No exceptions."""
 
         data = query.data.split('_')
 
-        if data[0] == 'vote':
-            season_id, week = int(data[1]), int(data[2])
-            vote_type = '_'.join(data[3:])
-            await self.process_vote(query, season_id, week, vote_type)
-        elif data[0] == 'status':
-            await self.show_status(query, int(data[1]), int(data[2]))
-        elif data[0] == 'season':
-            await self.handle_season_action(query, data[1])
-        elif data[0] == 'qvote':
+        if data[0] == 'qvote':
             # Quick poll vote
             poll_id = int(data[1])
             vote_type = data[2]
@@ -1245,58 +968,6 @@ Miss it = Miss the game. No exceptions."""
             # Quick poll status
             poll_id = int(data[1])
             await self.show_quickpoll_status(query, poll_id)
-
-    async def process_vote(self, query, season_id: int, week: int, vote_type: str):
-        user = query.from_user
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT id, closed FROM polls WHERE season_id = ? AND week_number = ?", (season_id, week))
-        poll = c.fetchone()
-        
-        if not poll:
-            await query.answer("Poll not found!", show_alert=True)
-            conn.close()
-            return
-        if poll[1]:
-            await query.answer("Voting is closed!", show_alert=True)
-            conn.close()
-            return
-
-        c.execute('INSERT OR REPLACE INTO votes (poll_id, user_id, username, vote_type) VALUES (?, ?, ?, ?)',
-                  (poll[0], user.id, user.username or user.first_name, vote_type))
-        conn.commit()
-        conn.close()
-        emoji = {'member_in': '✅', 'member_out': '❌', 'guest': '👥'}
-        await query.answer(f"{emoji.get(vote_type, '✅')} Vote recorded!")
-
-    async def show_status(self, query, season_id: int, week: int):
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT id FROM polls WHERE season_id = ? AND week_number = ?", (season_id, week))
-        poll = c.fetchone()
-        c.execute("SELECT max_players FROM season WHERE id = ?", (season_id,))
-        season = c.fetchone()
-        counts = {}
-        if poll:
-            c.execute("SELECT vote_type, COUNT(*) FROM votes WHERE poll_id = ? GROUP BY vote_type", (poll[0],))
-            counts = dict(c.fetchall())
-        conn.close()
-
-        members_in = counts.get('member_in', 0)
-        members_out = counts.get('member_out', 0)
-        guests = counts.get('guest', 0)
-        max_p = season[0] if season else 15
-        await query.answer(f"📊 IN: {members_in} | OUT: {members_out} | Guests: {guests} | Total: {members_in+guests}/{max_p}", show_alert=True)
-
-    async def handle_season_action(self, query, action: str):
-        await query.answer()
-        if action == 'stop':
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("UPDATE season SET active = 0")
-            conn.commit()
-            conn.close()
-        await query.message.reply_text("Use /newseason to set up a new season." if action != 'stop' else "✅ Season stopped.")
 
     async def process_quickpoll_vote(self, query, poll_id: int, vote_type: str):
         """Process a vote on a quick poll — enforces the wallet gate and per-vote charge."""
@@ -1428,91 +1099,6 @@ Miss it = Miss the game. No exceptions."""
         my_vote_str = vote_labels.get(my_vote[0], 'Unknown') if my_vote else 'Not voted yet'
 
         await query.answer(f"📊 Your vote: {my_vote_str}\n\nIN: {in_count} | OUT: {out_count} | Total: {in_count}/{max_players}", show_alert=True)
-
-    async def add_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await self.send(update, "Usage: /addmember Name")
-            return
-        
-        username = ' '.join(context.args).lstrip('@')
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO members (username, member_type) VALUES (?, 'member')", (username,))
-        conn.commit()
-        conn.close()
-        safe_username = username.replace('_', '\\_')
-        await self.send(update, f"✅ Added {safe_username}")
-
-    async def add_regular(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await self.send(update, "Usage: /addregular Name")
-            return
-        
-        username = ' '.join(context.args).lstrip('@')
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO members (username, member_type) VALUES (?, 'regular')", (username,))
-        conn.commit()
-        conn.close()
-        safe_username = username.replace('_', '\\_')
-        await self.send(update, f"✅ Added {safe_username} as a regular (drop-in)")
-
-    async def remove_regular(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await self.send(update, "Usage: /removeregular Name")
-            return
-        
-        username = ' '.join(context.args).lstrip('@')
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("DELETE FROM members WHERE username = ? AND member_type = 'regular'", (username,))
-        conn.commit()
-        conn.close()
-        safe_username = username.replace('_', '\\_')
-        await self.send(update, f"✅ Removed regular {safe_username}")
-
-    async def remove_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await self.send(update, "Usage: /removemember Name")
-            return
-        
-        username = ' '.join(context.args).lstrip('@')
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("DELETE FROM members WHERE username = ? AND member_type = 'member'", (username,))
-        conn.commit()
-        conn.close()
-        safe_username = username.replace('_', '\\_')
-        await self.send(update, f"✅ Removed {safe_username}")
-
-    async def list_members(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT username, member_type FROM members")
-        all_members = c.fetchall()
-        conn.close()
-        if not all_members:
-            await self.send(update, "No members. Use /addmember Name or /addregular Name")
-            return
-        
-        members = [m[0] for m in all_members if m[1] != 'regular']
-        regulars = [m[0] for m in all_members if m[1] == 'regular']
-        
-        text = ""
-        if members:
-            safe = [m.replace('_', '\\_') for m in members]
-            text += f"*📋 Members ({len(members)}):*\n" + '\n'.join([f"• {m}" for m in safe])
-        if regulars:
-            safe = [m.replace('_', '\\_') for m in regulars]
-            if text:
-                text += "\n\n"
-            text += f"*🔄 Regulars ({len(regulars)}):*\n" + '\n'.join([f"• {m}" for m in safe])
-        
-        await self.send(update, text)
 
     async def addadmin_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Add an admin for the current chat: /addadmin @username or /addadmin user_id"""
@@ -1991,10 +1577,11 @@ Miss it = Miss the game. No exceptions."""
         """Set the target chat for polls. 
         - In group: captures chat ID, deletes command instantly, confirms via DM
         - In private: requires manual chat ID as argument"""
-        if not self.is_super_admin(update.effective_user.id):
-            # In groups keep bot behavior silent after command deletion.
+        user = update.effective_user
+        # Super admin can always use; other admins can register groups from group context
+        if not self.is_super_admin(user.id) and not self.is_admin_any_chat(user.id, user.username):
             if update.effective_chat.type == 'private':
-                await self.send(update, "❌ You are not authorized to use this command.")
+                await self.send(update, "❌ Not allowed.")
             return
         
         user_id = update.effective_user.id
@@ -2028,7 +1615,7 @@ Miss it = Miss the game. No exceptions."""
             try:
                 await self.application.bot.send_message(
                     chat_id=user_id,
-                    text=f"✅ Group '{group_name_escaped}' registered\!\\n📱 ID: `{chat_id}`\\n💡 Ask the owner to run /addadmin to give you access",
+                    text=f"✅ Group '{group_name_escaped}' registered\!\n📱 ID: `{chat_id}`",
                     parse_mode='MarkdownV2'
                 )
             except Exception as e:
@@ -2064,49 +1651,8 @@ Miss it = Miss the game. No exceptions."""
             conn.close()
             
             group_name_escaped = self.escape_markdown(group_name)
-            await self.send(update, f"✅ Group '{group_name_escaped}' registered\n📱 ID: `{chat_id}`\n💡 Ask the owner to run /addadmin to give you access")
+            await self.send(update, f"✅ Group '{group_name_escaped}' registered\n📱 ID: `{chat_id}`")
 
-
-    async def status_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM season WHERE active = 1")
-        s = c.fetchone()
-        conn.close()
-        if not s:
-            await self.send(update, "No active season. Use /newseason")
-            return
-        await self.send(update, f"*Season:* {s[1]}\n🗓️ {s[3]} {s[4]}-{s[5]}\n📅 Week {s[9]}/{s[7]}")
-
-    async def testpoll_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send a test poll immediately to the registered chat"""
-        # Check admin authorization
-        is_admin, chat_id = await self.check_admin(update)
-        if not is_admin:
-            await self.send(update, "❌ You are not authorized to use this command.")
-            return
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM season WHERE active = 1")
-        season = c.fetchone()
-        c.execute("SELECT value FROM settings WHERE key = 'chat_id'")
-        chat_result = c.fetchone()
-        conn.close()
-
-        if not season:
-            await self.send(update, "❌ No active season. Use /newseason first.")
-            return
-        if not chat_result:
-            await self.send(update, "❌ No chat set. Use /setchat in your group first.")
-            return
-
-        chat_id = int(chat_result[0])
-        # Send a test poll for "week 1" with today's date
-        test_date = datetime.now(TZ).strftime('%Y-%m-%d')
-        await self.send(update, f"📤 Sending test poll to chat {chat_id}...")
-        await self.send_poll(season[0], 1, test_date, chat_id)
-        await self.send(update, "✅ Test poll sent! Check your group.")
 
     # ===== QUICK POLL (no season required) =====
     
@@ -2154,51 +1700,176 @@ Miss it = Miss the game. No exceptions."""
             if choice < 0 or choice >= len(groups):
                 await self.send(update, f"❌ Invalid choice. Pick 1–{len(groups)}.")
                 return QP_GROUP_SELECT
-            
+
             selected_chat_id, selected_name = groups[choice]
             context.user_data['qp']['target_chat_id'] = selected_chat_id
             context.user_data['qp']['target_group_name'] = selected_name
-            
+
         except ValueError:
             await self.send(update, "❌ Please enter a valid number.")
             return QP_GROUP_SELECT
 
-        await self.send(update, "✅ Step 2/10: Enter *location name*:", parse_mode='Markdown')
+        # Check for a previous poll on this chat to offer pre-fill
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""SELECT location_name, location_link, game_date, time_start, time_end,
+                            max_players, num_teams
+                       FROM quickpolls WHERE chat_id = ?
+                       ORDER BY created_at DESC LIMIT 1""", (selected_chat_id,))
+        prev = c.fetchone()
+        conn.close()
+
+        if prev:
+            context.user_data['qp']['prev'] = {
+                'location_name': prev[0],
+                'location_link': prev[1],
+                'date': prev[2],
+                'time_start': prev[3],
+                'time_end': prev[4],
+                'max_players': prev[5],
+                'num_teams': prev[6],
+            }
+            # Suggest next date (+7 days from last game)
+            try:
+                from datetime import timedelta as _td
+                next_date = (datetime.strptime(prev[2], '%Y-%m-%d') + _td(days=7)).strftime('%Y-%m-%d')
+            except Exception:
+                next_date = prev[2]
+            context.user_data['qp']['prev']['next_date'] = next_date
+
+            keyboard = [
+                [InlineKeyboardButton("📋 Reuse last poll (same details)", callback_data="qp_use_last")],
+                [InlineKeyboardButton("✏️ Start from last poll (edit fields)", callback_data="qp_edit_last")],
+                [InlineKeyboardButton("🆕 Fresh start", callback_data="qp_fresh")],
+            ]
+            summary = (
+                f"📌 *Last poll for {selected_name}:*\n"
+                f"📍 {prev[0]}\n"
+                f"🗓 {prev[2]} | {prev[3]}–{prev[4]}\n"
+                f"👥 Max: {prev[5]}\n\n"
+                f"What do you want to do?"
+            )
+            await self.send(update, summary, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return QP_REPEAT_CHECK
+
+        await self.send(update, "Step 2/9: Enter *location name*:", parse_mode='Markdown')
+        return QP_LOCATION_NAME
+
+    async def qp_repeat_use_last(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Pre-fill all fields from prev poll, advance date by 7 days, go straight to final."""
+        await update.callback_query.answer()
+        prev = context.user_data['qp'].get('prev', {})
+        qp = context.user_data['qp']
+        qp['location_name'] = prev['location_name']
+        qp['location_link'] = prev['location_link']
+        qp['date'] = prev.get('next_date', prev['date'])
+        qp['time_start'] = prev['time_start']
+        qp['time_end'] = prev['time_end']
+        qp['max_players'] = prev['max_players']
+        qp['num_teams'] = prev['num_teams']
+        # We still need deadline and auto_teams — ask for deadline next
+        await self.send(update, f"✅ Fields pre-filled. Date set to *{qp['date']}*.\n\nStep: How many hours until the deadline? (e.g., 24):", parse_mode='Markdown')
+        return QP_DEADLINE
+
+    async def qp_repeat_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Pre-fill fields from prev but let admin edit them one by one."""
+        await update.callback_query.answer()
+        prev = context.user_data['qp'].get('prev', {})
+        qp = context.user_data['qp']
+        qp['location_name'] = prev['location_name']
+        qp['location_link'] = prev['location_link']
+        qp['date'] = prev.get('next_date', prev['date'])
+        qp['time_start'] = prev['time_start']
+        qp['time_end'] = prev['time_end']
+        qp['max_players'] = prev['max_players']
+        qp['num_teams'] = prev['num_teams']
+        qp['edit_mode'] = True
+        await self.send(
+            update,
+            f"✏️ *Edit mode* — send a new value or *.* to keep the current one.\n\n"
+            f"Step 2/9: Location name\nCurrent: *{prev['location_name']}*",
+            parse_mode='Markdown'
+        )
+        return QP_LOCATION_NAME
+
+    async def qp_repeat_fresh(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ignore prev poll data, start fresh."""
+        await update.callback_query.answer()
+        context.user_data['qp'].pop('prev', None)
+        context.user_data['qp'].pop('edit_mode', None)
+        await self.send(update, "Step 2/9: Enter *location name*:", parse_mode='Markdown')
         return QP_LOCATION_NAME
 
     async def qp_get_location_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['qp']['location_name'] = update.message.text
-        await self.send(update, "✅ Step 3/10: Enter *Google Maps link*:")
+        qp = context.user_data['qp']
+        text = update.message.text.strip()
+        if text != '.' or 'location_name' not in qp:
+            qp['location_name'] = text
+        if qp.get('edit_mode'):
+            cur = qp.get('location_link', '')
+            await self.send(update, f"Step 3/9: Google Maps link\nCurrent: {cur}\n\nSend new value or *.* to keep:", parse_mode='Markdown')
+        else:
+            await self.send(update, "Step 3/9: Enter *Google Maps link*:", parse_mode='Markdown')
         return QP_LOCATION_LINK
 
     async def qp_get_location_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['qp']['location_link'] = update.message.text
-        await self.send(update, "✅ Step 4/10: Enter *game date* (YYYY-MM-DD):")
+        qp = context.user_data['qp']
+        text = update.message.text.strip()
+        if text != '.' or 'location_link' not in qp:
+            qp['location_link'] = text
+        if qp.get('edit_mode'):
+            cur = qp.get('date', '')
+            await self.send(update, f"Step 4/9: Game date\nCurrent: {cur}\n\nSend new date (YYYY-MM-DD) or *.* to keep:", parse_mode='Markdown')
+        else:
+            await self.send(update, "Step 4/9: Enter *game date* (YYYY-MM-DD):", parse_mode='Markdown')
         return QP_DATE
 
     async def qp_get_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['qp']['date'] = update.message.text.strip()
-        await self.send(update, "✅ Step 5/10: Enter *start time* (HH:MM):")
+        qp = context.user_data['qp']
+        text = update.message.text.strip()
+        if text != '.' or 'date' not in qp:
+            qp['date'] = text
+        if qp.get('edit_mode'):
+            cur = qp.get('time_start', '')
+            await self.send(update, f"Step 5/9: Start time\nCurrent: {cur}\n\nSend new time (HH:MM) or *.* to keep:", parse_mode='Markdown')
+        else:
+            await self.send(update, "Step 5/9: Enter *start time* (HH:MM):", parse_mode='Markdown')
         return QP_TIME_START
 
     async def qp_get_time_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['qp']['time_start'] = update.message.text.strip()
-        await self.send(update, "✅ Step 6/10: Enter *end time* (HH:MM):")
+        qp = context.user_data['qp']
+        text = update.message.text.strip()
+        if text != '.' or 'time_start' not in qp:
+            qp['time_start'] = text
+        if qp.get('edit_mode'):
+            cur = qp.get('time_end', '')
+            await self.send(update, f"Step 6/9: End time\nCurrent: {cur}\n\nSend new time (HH:MM) or *.* to keep:", parse_mode='Markdown')
+        else:
+            await self.send(update, "Step 6/9: Enter *end time* (HH:MM):", parse_mode='Markdown')
         return QP_TIME_END
 
     async def qp_get_time_end(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['qp']['time_end'] = update.message.text.strip()
-        await self.send(update, "✅ Step 7/10: Enter *max players* (number):")
+        qp = context.user_data['qp']
+        text = update.message.text.strip()
+        if text != '.' or 'time_end' not in qp:
+            qp['time_end'] = text
+        if qp.get('edit_mode'):
+            cur = qp.get('max_players', '')
+            await self.send(update, f"Step 7/9: Max players\nCurrent: {cur}\n\nSend new number or *.* to keep:", parse_mode='Markdown')
+        else:
+            await self.send(update, "Step 7/9: Enter *max players* (number):", parse_mode='Markdown')
         return QP_MAX_PLAYERS
 
     async def qp_get_max_players(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            max_players = int(update.message.text.strip())
-        except ValueError:
-            await self.send(update, "Please enter a number:")
-            return QP_MAX_PLAYERS
-        context.user_data['qp']['max_players'] = max_players
-        await self.send(update, "✅ Step 8/10: Enter *voting deadline* in hours (e.g., 2), or *skip* for no deadline:")
+        qp = context.user_data['qp']
+        text = update.message.text.strip()
+        if text != '.' or 'max_players' not in qp:
+            try:
+                qp['max_players'] = int(text)
+            except ValueError:
+                await self.send(update, "Please enter a number:")
+                return QP_MAX_PLAYERS
+        await self.send(update, "Step 8/9: Enter *voting deadline* in hours (e.g., 24), or *skip* for no deadline:", parse_mode='Markdown')
         return QP_DEADLINE
 
     async def qp_get_deadline(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2206,15 +1877,15 @@ Miss it = Miss the game. No exceptions."""
         if text in ('skip', 'no', 'n'):
             context.user_data['qp']['deadline_hours'] = None
             context.user_data['qp']['auto_teams'] = False
-            context.user_data['qp']['num_teams'] = 0
+            context.user_data['qp']['num_teams'] = context.user_data['qp'].get('num_teams', 0)
             return await self._send_quickpoll_final(update, context)
         try:
             hours = float(text)
         except ValueError:
-            await self.send(update, "Please enter a number of hours, or *skip* for no deadline:")
+            await self.send(update, "Please enter a number of hours, or *skip* for no deadline:", parse_mode='Markdown')
             return QP_DEADLINE
         context.user_data['qp']['deadline_hours'] = hours
-        await self.send(update, "✅ Step 9/10: Auto-create teams when voting closes? (*yes* or *no*):")
+        await self.send(update, "Step 9/9: Auto-create teams when voting closes? (*yes* or *no*):", parse_mode='Markdown')
         return QP_AUTO_TEAMS
 
     async def qp_get_auto_teams(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2360,10 +2031,10 @@ Miss it = Miss the game. No exceptions."""
         deadline_iso = deadline_time.isoformat() if deadline_time else None
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute('''INSERT INTO quickpolls (id, location_name, max_players, deadline_time, num_teams, chat_id, admin_id, telegram_poll_id, poll_message_id, game_date, time_start)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (poll_id, location_name, max_players, deadline_iso, num_teams, chat_id, admin_id,
-                   None, poll_msg.message_id, game_date, time_start))
+        c.execute('''INSERT INTO quickpolls (id, location_name, location_link, max_players, deadline_time, num_teams, chat_id, admin_id, telegram_poll_id, poll_message_id, game_date, time_start, time_end)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  (poll_id, location_name, location_link, max_players, deadline_iso, num_teams, chat_id, admin_id,
+                   None, poll_msg.message_id, game_date, time_start, time_end))
         
         # Link any pending late arrivals from previous polls to this new poll
         # (auto-link for next poll feature)
@@ -2885,15 +2556,7 @@ Miss it = Miss the game. No exceptions."""
             for event_id, event_type, payload_json in events:
                 payload = json.loads(payload_json)
                 try:
-                    if event_type == 'send_poll':
-                        await self.send_poll(payload['season_id'], payload['week'], payload['game_date'], payload['chat_id'])
-                    elif event_type == 'update_countdown':
-                        await self.update_countdown(payload['poll_id'], payload['msg_id'], payload['chat_id'], payload['hours_left'])
-                    elif event_type == 'send_reminder':
-                        await self.send_nonvoter_reminder(payload['poll_id'], payload['chat_id'])
-                    elif event_type == 'close_poll':
-                        await self.close_poll(payload['poll_id'], payload['chat_id'], payload['season_id'], payload['week'])
-                    elif event_type == 'close_quickpoll':
+                    if event_type == 'close_quickpoll':
                         # Auto-close native poll + post roster
                         qp_poll_id = payload['poll_id']
                         qp_chat_id = payload['chat_id']
@@ -2943,167 +2606,136 @@ Miss it = Miss the game. No exceptions."""
     # ===== CANCELLATION COMMANDS =====
 
     async def cancelquickpoll_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Cancel the most recent quickpoll: /cancelquickpoll"""
+        """Step 1: Ask admin for a cancellation reason before proceeding."""
         if update.effective_chat.type in ['group', 'supergroup']:
             await self.delete_message_safely(update.effective_chat.id, update.message.message_id)
 
         target_chat_id, error = await self.resolve_chat_context(update, context)
         if error:
             await self.send(update, error)
+            return ConversationHandler.END
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, chat_id FROM quickpolls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1", (target_chat_id,))
+        poll = c.fetchone()
+        conn.close()
+
+        if not poll:
+            await self.send(update, "❌ No quickpoll found to cancel.")
+            return ConversationHandler.END
+
+        context.user_data['cancel_qp_poll_id'] = poll[0]
+        context.user_data['cancel_qp_chat_id'] = poll[1]
+
+        await self.send(update, "What's the reason for cancelling?\n\nSend your reason or /skip to cancel without one.")
+        return CANCEL_QP_REASON
+
+    async def cancel_qp_reason(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Step 2a: Got a reason — execute cancellation."""
+        reason = update.message.text.strip()
+        await self._execute_cancel_quickpoll(update, context, reason)
+        return ConversationHandler.END
+
+    async def cancel_qp_skip(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Step 2b: Admin skipped the reason — cancel with no reason given."""
+        await self._execute_cancel_quickpoll(update, context, "No reason given.")
+        return ConversationHandler.END
+
+    async def _execute_cancel_quickpoll(self, update: Update, context: ContextTypes.DEFAULT_TYPE, reason: str):
+        """Internal: run the actual quickpoll cancellation after reason is collected."""
+        poll_id = context.user_data.pop('cancel_qp_poll_id', None)
+        chat_id = context.user_data.pop('cancel_qp_chat_id', None)
+        if not poll_id or not chat_id:
+            await self.send(update, "❌ Could not find poll to cancel.")
             return
 
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        # Find cancelable poll for this specific chat
-        c.execute("SELECT id, chat_id FROM quickpolls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1", (target_chat_id,))
-        poll = c.fetchone()
 
-        if not poll:
-            await self.send(update, "❌ No quickpoll found to cancel.")
-            conn.close()
-            return
-
-        poll_id, chat_id = poll
-
-        # Cancel pending deadline events (teams + auto-close) for this poll
+        # Cancel pending deadline events for this poll
         c.execute("SELECT id, payload FROM scheduled_events WHERE event_type IN ('finalize_teams', 'close_quickpoll') AND executed = 0")
         for eid, payload_json in c.fetchall():
             payload = json.loads(payload_json)
             if payload.get('poll_id') == poll_id:
                 c.execute("UPDATE scheduled_events SET executed = 1 WHERE id = ?", (eid,))
 
-        # Collect IN voters so their per-vote charge can be refunded
+        # Collect IN voters for refund
         c.execute("SELECT username FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
         in_voters = [r[0] for r in c.fetchall()]
 
-        # Disable the poll buttons if the message exists
+        # Grab message ID to close buttons
         c.execute("SELECT poll_message_id FROM quickpolls WHERE id = ?", (poll_id,))
         res = c.fetchone()
         poll_msg_id = res[0] if res else None
 
-        # Clear the votes so the poll can't be cancelled (and refunded) twice
+        # Clear votes so refund can't happen twice
         c.execute("DELETE FROM quickpoll_votes WHERE poll_id = ?", (poll_id,))
-
-        # Determine who to ask for approval (the user who ran the command)
-        admin_id = update.effective_user.id
-
-        await self.close_quickpoll_buttons(chat_id, poll_msg_id)
-
         conn.commit()
         conn.close()
 
-        # Refund every IN voter — the game was cancelled, nobody should be charged
+        admin_id = update.effective_user.id
+        await self.close_quickpoll_buttons(chat_id, poll_msg_id)
+
+        # Refund every IN voter
         for voter in in_voters:
             self.credit_wallet(voter, VOTE_COST, f"quickpoll_cancelled:{poll_id}")
 
-        # Instead of posting to group immediately, ask admin for approval
+        group_text = (
+            f"❌ *Game poll cancelled.*\n\n"
+            f"📢 Reason: {reason}\n\n"
+            f"💸 {len(in_voters)} player(s) have been refunded ${VOTE_COST:.0f} each."
+        )
         await self.request_approval(
             admin_id,
-            f"❌ *Quick poll has been cancelled!*\n💸 {len(in_voters)} player(s) refunded ${VOTE_COST:.0f} each.",
+            group_text,
             f"cancel:{poll_id}:{chat_id}",
             "Post cancellation notice to group?"
         )
 
         await self.send(update, f"✅ Quick poll cancelled. {len(in_voters)} player(s) refunded ${VOTE_COST:.0f} each.")
 
-    async def cancelgame_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Cancel a game session in the active season: /cancelgame [week]"""
-        # Determine target chat context
-        if update.effective_chat.type in ['group', 'supergroup']:
-            target_chat_id = update.effective_chat.id
+    async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Warm welcome message with role-aware guidance."""
+        user = update.effective_user
+        if self.is_super_admin(user.id):
+            role = 'super'
+        elif self.is_admin_any_chat(user.id, user.username):
+            role = 'admin'
         else:
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("""
-                SELECT ca.chat_id FROM chat_admins ca
-                JOIN chat_groups cg ON ca.chat_id = cg.chat_id
-                WHERE ca.user_id = ?
-                ORDER BY ca.added_at DESC LIMIT 1
-            """, (update.effective_user.id,))
-            res = c.fetchone()
-            conn.close()
-            
-            if res:
-                target_chat_id = res[0]
-            else:
-                target_chat_id = None
-        
-        # We need to find the season for THIS chat.
-        # Currently the schema doesn't link season to chat_id explicitly (it assumes 1 season globally).
-        # But let's at least try to be consistent if possible, or just warn if no context.
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT id FROM season WHERE active = 1")
-        season = c.fetchone()
+            role = 'player'
 
-        if not season:
-            await self.send(update, "❌ No active season.")
-            conn.close()
-            return
-
-        season_id = season[0]
-
-        # Determine which week to cancel
-        if context.args and context.args[0].isdigit():
-            week = int(context.args[0])
-        else:
-            # Find the next upcoming game: check open polls first, then pending send_poll events
-            week = None
-            c.execute("SELECT week_number FROM polls WHERE season_id = ? AND closed = 0 ORDER BY week_number ASC LIMIT 1", (season_id,))
-            result = c.fetchone()
-            if result:
-                week = result[0]
-            else:
-                # Check pending send_poll events
-                c.execute("SELECT id, payload FROM scheduled_events WHERE event_type = 'send_poll' AND executed = 0 ORDER BY fire_time ASC")
-                for _, payload_json in c.fetchall():
-                    payload = json.loads(payload_json)
-                    if payload.get('season_id') == season_id:
-                        week = payload['week']
-                        break
-
-            if week is None:
-                await self.send(update, "❌ No upcoming game found to cancel.")
-                conn.close()
-                return
-
-        # Cancel all pending events for this week
-        c.execute("SELECT id, payload FROM scheduled_events WHERE executed = 0")
-        cancelled = 0
-        for eid, payload_json in c.fetchall():
-            payload = json.loads(payload_json)
-            if payload.get('season_id') == season_id and payload.get('week') == week:
-                c.execute("UPDATE scheduled_events SET executed = 1 WHERE id = ?", (eid,))
-                cancelled += 1
-
-        # Close the poll if one exists
-        c.execute("SELECT message_id, chat_id FROM polls WHERE season_id = ? AND week_number = ?", (season_id, week))
-        poll = c.fetchone()
-        if poll:
-            c.execute("UPDATE polls SET closed = 1 WHERE season_id = ? AND week_number = ?", (season_id, week))
-            msg_id, poll_chat_id = poll
-            try:
-                await self.application.bot.edit_message_text(
-                    chat_id=poll_chat_id, message_id=msg_id,
-                    text="❌ *This game has been cancelled.*",
-                    parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([])
-                )
-            except Exception:
-                pass
-
-        conn.commit()
-        conn.close()
-
-        # Send cancellation message to the correct group
-        if target_chat_id:
-            await self.application.bot.send_message(
-                chat_id=target_chat_id,
-                text=f"⚠️ *Week {week} game has been cancelled!*",
-                parse_mode='Markdown'
+        greeting = "سلام گل گلاب\! بذار بهت بگم چطوری میتونم در خدمتت باشم 🙌\n\n"
+        if role in ('admin', 'super'):
+            body = (
+                "Here's what I can do for you:\n\n"
+                "🗳 /quickpoll — Create a game poll for your group\. I'll collect votes, charge $10 per player, and handle refunds automatically\.\n"
+                "✅ /closepoll — Close voting early and send the final lineup for your approval\.\n"
+                "❌ /cancelquickpoll — Cancel a poll and refund everyone automatically\.\n"
+                "⚽ /maketeams — Split voted\-in players into balanced teams based on skill ratings\.\n"
+                "⭐ /setskill, /skills, /deleteskill — Manage skill ratings for fair team splits\.\n"
+                "💰 /wallet, /topup, /cashout — Your own wallet: check balance, add funds, or withdraw\.\n\n"
+                "Just send /quickpoll to get started\."
             )
+        else:
+            body = (
+                "Here's what I can do for you:\n\n"
+                "💰 /wallet — Check your balance and recent game activity\.\n"
+                "💳 /topup — Add funds to your wallet so you can vote in on games\. Each game costs $10\.\n"
+                "💸 /cashout — Withdraw your balance back to Venmo anytime\.\n\n"
+                "When there's a game poll in your group, tap *IN* to join — $10 is deducted from your wallet\. Switch to *OUT* before the deadline to get it back\."
+            )
+        await self.send(update, greeting + body, parse_mode='MarkdownV2')
 
-        await self.send(update, f"✅ Week {week} cancelled. {cancelled} scheduled events removed.")
+    async def unknown_message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Warm reply for unexpected messages in private chat."""
+        import random
+        responses = [
+            "Hmm, not sure what to do with that one\! Try /wallet to check your balance or /topup to add funds\.",
+            "That one went over my head\! Here's what I'm good at: /wallet, /topup, /cashout — give one of those a go\.",
+            "Not quite my language, but I've got your back for the important stuff\. Start with /wallet to see where things stand\.",
+        ]
+        await self.send(update, random.choice(responses), parse_mode='MarkdownV2')
 
     async def delete_group_commands(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Delete any command messages sent in groups to keep bot invisible"""
@@ -3114,7 +2746,7 @@ Miss it = Miss the game. No exceptions."""
     def run(self):
         persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
         self.application = Application.builder().token(self.token).persistence(persistence).post_init(self.on_startup).build()
-        
+
         # Group command deletion handler (must be first to delete commands before processing)
         self.application.add_handler(MessageHandler(
             filters.ChatType.GROUPS & filters.Regex(r'^/'),
@@ -3126,37 +2758,17 @@ Miss it = Miss the game. No exceptions."""
             filters.ChatType.PRIVATE & filters.COMMAND,
             self.private_command_guard
         ), group=-1)
-        
-        season_handler = ConversationHandler(
-            entry_points=[CommandHandler('newseason', self.newseason_start, filters=filters.ChatType.PRIVATE)],
-            states={
-                LOCATION_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.get_location_name)],
-                LOCATION_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.get_location_link)],
-                GAME_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.get_game_day)],
-                GAME_TIME_START: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.get_time_start)],
-                GAME_TIME_END: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.get_time_end)],
-                START_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.get_start_date)],
-                DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.get_duration)],
-                MAX_PLAYERS: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.get_max_players)],
-            },
-            fallbacks=[
-                CommandHandler('cancel', self.cancel_setup),
-                CommandHandler('newseason', self.newseason_start),  # Allow restart mid-conversation
-            ],
-            allow_reentry=True,
-            name='season_setup',
-            persistent=True,
-        )
 
-        self.application.add_handler(season_handler)
-        
-
-        
-        # Quick poll handler (no season required)
+        # Quick poll conversation handler
         quickpoll_handler = ConversationHandler(
             entry_points=[CommandHandler('quickpoll', self.quickpoll_start, filters=filters.ChatType.PRIVATE)],
             states={
                 QP_GROUP_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_group_select)],
+                QP_REPEAT_CHECK: [
+                    CallbackQueryHandler(self.qp_repeat_use_last, pattern='^qp_use_last$'),
+                    CallbackQueryHandler(self.qp_repeat_edit, pattern='^qp_edit_last$'),
+                    CallbackQueryHandler(self.qp_repeat_fresh, pattern='^qp_fresh$'),
+                ],
                 QP_LOCATION_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_location_name)],
                 QP_LOCATION_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_location_link)],
                 QP_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_date)],
@@ -3169,13 +2781,29 @@ Miss it = Miss the game. No exceptions."""
             },
             fallbacks=[
                 CommandHandler('cancel', self.qp_cancel),
-                CommandHandler('quickpoll',self.quickpoll_start),
+                CommandHandler('quickpoll', self.quickpoll_start),
             ],
             allow_reentry=True,
             name='quickpoll_setup',
             persistent=True,
         )
         self.application.add_handler(quickpoll_handler)
+
+        # Cancel quickpoll conversation (asks for reason first)
+        cancelquickpoll_handler = ConversationHandler(
+            entry_points=[CommandHandler('cancelquickpoll', self.cancelquickpoll_cmd, filters=filters.ChatType.PRIVATE)],
+            states={
+                CANCEL_QP_REASON: [
+                    CommandHandler('skip', self.cancel_qp_skip),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.cancel_qp_reason),
+                ],
+            },
+            fallbacks=[CommandHandler('cancel', self.cancel_qp_skip)],
+            allow_reentry=True,
+            name='cancel_quickpoll',
+            persistent=True,
+        )
+        self.application.add_handler(cancelquickpoll_handler)
 
         # Wallet conversations: custom top-up amount + cash-out
         topup_custom_handler = ConversationHandler(
@@ -3197,19 +2825,13 @@ Miss it = Miss the game. No exceptions."""
         )
         self.application.add_handler(cashout_handler)
 
-        # Admin commands with private chat filters
+        # Standalone commands
+        self.application.add_handler(CommandHandler('start', self.start_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('setchat', self.set_chat))  # Works in both group and private
         self.application.add_handler(CommandHandler('addadmin', self.addadmin_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('removeadmin', self.removeadmin_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('listadmins', self.listadmins_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('listchats', self.listchats_cmd, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('addmember', self.add_member, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('removemember', self.remove_member, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('addregular', self.add_regular, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('removeregular', self.remove_regular, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('members', self.list_members, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('status', self.status_cmd, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('testpoll', self.testpoll_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('setskill', self.setskill_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('skills', self.skills_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('deleteskill', self.deleteskill_cmd, filters=filters.ChatType.PRIVATE))
@@ -3219,20 +2841,25 @@ Miss it = Miss the game. No exceptions."""
         self.application.add_handler(CommandHandler('clearlate', self.clearlate_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('maketeams', self.maketeams_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('closepoll', self.closepoll_cmd, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('cancelquickpoll', self.cancelquickpoll_cmd, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('cancelgame', self.cancelgame_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('wallet', self.wallet_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('topup', self.topup_cmd, filters=filters.ChatType.PRIVATE))
 
-        # Handler for late arrivals input (captures admin's response to prompt)
+        # Approval callbacks (approve/discard buttons on admin DMs)
+        self.application.add_handler(CallbackQueryHandler(self.handle_approval_callback, pattern='^(approve|discard):'))
+        # All other inline callbacks (votes, status, etc.)
+        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
+
+        # Late arrivals input (admin responding to bot prompt in private)
         self.application.add_handler(MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
             self.handle_late_arrivals_input
         ))
-        
-        # Public handlers - anyone can use these
-        self.application.add_handler(CallbackQueryHandler(self.handle_approval_callback, pattern='^(approve|discard):'))
-        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
+
+        # Unknown message fallback for private chats
+        self.application.add_handler(MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT,
+            self.unknown_message_handler
+        ))
 
         # Clean up group commands (delete them to reduce spam)
         self.application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.COMMAND, self.delete_group_commands), group=1)
