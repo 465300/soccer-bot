@@ -369,6 +369,10 @@ class SoccerBotV2:
             PRIMARY KEY (chat_id, user_id))''')
         # Migration: purge rows where chat_id is positive (DM/private context, not a group)
         c.execute("DELETE FROM chat_admins WHERE chat_id > 0")
+        # Migration: ensure super-admin is in chat_admins for all existing groups
+        if SUPER_ADMIN_ID:
+            c.execute("""INSERT OR IGNORE INTO chat_admins (chat_id, user_id, username)
+                         SELECT chat_id, ?, NULL FROM chat_groups""", (SUPER_ADMIN_ID,))
         # Chat groups table for named multi-group management
         c.execute('''CREATE TABLE IF NOT EXISTS chat_groups (
             chat_id INTEGER PRIMARY KEY,
@@ -1589,10 +1593,20 @@ class SoccerBotV2:
         chat_id = chat.id
         group_name = chat.title or f"Group{abs(chat_id) % 10000}"
 
+        added_by = result.from_user  # person who added the bot
+
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO chat_groups (chat_id, group_name) VALUES (?, ?)",
                   (chat_id, group_name))
+        # Auto-register super-admin as admin for this group
+        if SUPER_ADMIN_ID:
+            c.execute("INSERT OR IGNORE INTO chat_admins (chat_id, user_id, username) VALUES (?, ?, ?)",
+                      (chat_id, SUPER_ADMIN_ID, None))
+        # Also register whoever added the bot, if different
+        if added_by and added_by.id != SUPER_ADMIN_ID:
+            c.execute("INSERT OR IGNORE INTO chat_admins (chat_id, user_id, username) VALUES (?, ?, ?)",
+                      (chat_id, added_by.id, added_by.username))
         conn.commit()
         conn.close()
 
