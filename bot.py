@@ -364,6 +364,8 @@ class SoccerBotV2:
             username TEXT,
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (chat_id, user_id))''')
+        # Migration: purge rows where chat_id is positive (DM/private context, not a group)
+        c.execute("DELETE FROM chat_admins WHERE chat_id > 0")
         # Chat groups table for named multi-group management
         c.execute('''CREATE TABLE IF NOT EXISTS chat_groups (
             chat_id INTEGER PRIMARY KEY,
@@ -1535,6 +1537,12 @@ Miss it = Miss the game. No exceptions."""
             return
         
         chat_id = int(chat_result[0])
+
+        if chat_id > 0:
+            conn.close()
+            await self.send(update, "❌ No valid group chat set. Run /setchat from inside the group first.")
+            return
+
         arg = context.args[0].lstrip('@')
         
         # Check if it's a user_id (numeric) or username
