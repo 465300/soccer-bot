@@ -614,7 +614,7 @@ class SoccerBotV2:
         if not wallet['first_paid']:
             return (False, "No confirmed payment yet. DM me /topup to add funds.")
         if wallet['balance'] <= WALLET_FLOOR:
-            return (False, f"Balance too low (${wallet['balance']:.2f}). You need more than ${WALLET_FLOOR:.0f} to vote in. DM me /topup.")
+            return (False, f"Balance insufficient. DM me /topup to add funds.")
         return (True, "Eligible")
 
     def credit_wallet(self, username: str, amount: float, reason: str = "topup") -> bool:
@@ -703,9 +703,8 @@ class SoccerBotV2:
         """Build the top-up amount-selection message (text, keyboard). Reused by /topup and the gate."""
         text = (
             "💳 *Top up your wallet*\n\n"
-            f"Add funds via Venmo to join games — each game costs ${VOTE_COST:.0f} "
-            "from your balance.\n\n"
-            "We recommend *$50*: top up once, play several games, done. "
+            "Add funds via Venmo to join games — cost per game may vary due to dynamic player count.\n\n"
+            "Recommend *$50*: top up once, play several games, done. "
             "Use *Custom* only if you need a different amount."
         )
         keyboard = InlineKeyboardMarkup([
