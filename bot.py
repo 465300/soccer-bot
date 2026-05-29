@@ -64,7 +64,7 @@ CANCEL_QP_REASON = 123
 # ===== Payment / wallet config =====
 VENMO_HANDLE = '@chico-leo'  # Venmo handle players pay to for top-ups
 VOTE_COST = 10.00      # charged per IN vote, refunded on switch to OUT
-WALLET_FLOOR = 15.00   # minimum balance required to vote IN
+WALLET_FLOOR = 10.00   # minimum balance required to vote IN
 TOPUP_MIN = 20.00      # minimum custom top-up amount
 
 # Super-admin controls: only this user can manage admin lifecycle
@@ -767,7 +767,7 @@ class SoccerBotV2:
         balance = wallet['balance'] if wallet else amount
         await query.edit_message_text(
             f"✅ *${amount:.2f} added* — your balance is now *${balance:.2f}*.\n\n"
-            "You're set for the next few games. We'll nudge you when it's time "
+            "You're set for the next few games. Will nudge you when it's time "
             "to top up again.",
             parse_mode='Markdown')
 
@@ -2333,18 +2333,21 @@ class SoccerBotV2:
             # Delete command message in group
             await self.delete_message_safely(update.effective_chat.id, update.message.message_id)
 
-        target_chat_id, error = await self.resolve_chat_context(update, context)
-        if error:
-            await self.send(update, error)
-            return
-
+        user_id = update.effective_user.id
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        # Find the most recent poll specifically for this target chat
-        c.execute("SELECT id, chat_id, poll_message_id FROM quickpolls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1", (target_chat_id,))
+        if update.effective_chat.type in ['group', 'supergroup']:
+            c.execute("SELECT id, chat_id, poll_message_id FROM quickpolls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1", (update.effective_chat.id,))
+        else:
+            c.execute("""
+                SELECT qp.id, qp.chat_id, qp.poll_message_id FROM quickpolls qp
+                JOIN chat_admins ca ON qp.chat_id = ca.chat_id
+                WHERE ca.user_id = ?
+                ORDER BY qp.created_at DESC LIMIT 1
+            """, (user_id,))
         poll = c.fetchone()
         conn.close()
-        
+
         if not poll:
             await self.send(update, "❌ No quickpoll found to close.")
             return
@@ -2607,14 +2610,18 @@ class SoccerBotV2:
         if update.effective_chat.type in ['group', 'supergroup']:
             await self.delete_message_safely(update.effective_chat.id, update.message.message_id)
 
-        target_chat_id, error = await self.resolve_chat_context(update, context)
-        if error:
-            await self.send(update, error)
-            return ConversationHandler.END
-
+        user_id = update.effective_user.id
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT id, chat_id FROM quickpolls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1", (target_chat_id,))
+        if update.effective_chat.type in ['group', 'supergroup']:
+            c.execute("SELECT id, chat_id FROM quickpolls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1", (update.effective_chat.id,))
+        else:
+            c.execute("""
+                SELECT qp.id, qp.chat_id FROM quickpolls qp
+                JOIN chat_admins ca ON qp.chat_id = ca.chat_id
+                WHERE ca.user_id = ?
+                ORDER BY qp.created_at DESC LIMIT 1
+            """, (user_id,))
         poll = c.fetchone()
         conn.close()
 
