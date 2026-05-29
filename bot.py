@@ -715,16 +715,18 @@ class SoccerBotV2:
         return text, keyboard
 
     def build_venmo_card(self, amount: float) -> tuple:
-        """Build the Venmo payment-instructions message (text, keyboard) for a chosen amount."""
-        venmo_display = VENMO_HANDLE.replace('_', '\\_')
+        """Build the Venmo payment card with a direct deep link button."""
+        venmo_url = (
+            f"https://venmo.com/u/{VENMO_HANDLE}"
+            f"?txn=pay&amount={amount:.2f}&note=Soccer%20game"
+        )
         text = (
             f"💵 *Pay ${amount:.2f} via Venmo*\n\n"
-            f"1. Send *${amount:.2f}* to *{venmo_display}* on Venmo\n"
-            "2. Come back to this chat\n"
-            "3. Tap *I've Paid* below\n\n"
-            "_Only tap confirm after you have actually sent the payment._"
+            "Tap below to open Venmo — amount is pre-filled. "
+            "Come back and confirm once sent."
         )
         keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💸 Pay ${amount:.2f} on Venmo →", url=venmo_url)],
             [InlineKeyboardButton("✅ I've Paid", callback_data=f"ctopup:{amount}")],
         ])
         return text, keyboard
