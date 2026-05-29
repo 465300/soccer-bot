@@ -610,11 +610,11 @@ class SoccerBotV2:
         """Check if wallet is eligible for voting. Returns (eligible, reason)."""
         wallet = self.get_wallet(username)
         if not wallet:
-            return (False, "You don't have a wallet yet. DM me /topup to add funds.")
+            return (False, "You don't have a wallet yet.")
         if not wallet['first_paid']:
-            return (False, "No confirmed payment yet. DM me /topup to add funds.")
+            return (False, "No confirmed payment on file.")
         if wallet['balance'] <= WALLET_FLOOR:
-            return (False, f"Balance insufficient. DM me /topup to add funds.")
+            return (False, "Balance insufficient.")
         return (True, "Eligible")
 
     def credit_wallet(self, username: str, amount: float, reason: str = "topup") -> bool:
@@ -704,8 +704,7 @@ class SoccerBotV2:
         text = (
             "💳 *Top up your wallet*\n\n"
             "Add funds via Venmo to join games — cost per game may vary due to dynamic player count.\n\n"
-            "Recommend *$50*: top up once, play several games, done. "
-            "Use *Custom* only if you need a different amount."
+            "Recommend *$50*: top up once, play several games, done."
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("$50", callback_data="topup:50"),
@@ -716,8 +715,9 @@ class SoccerBotV2:
 
     def build_venmo_card(self, amount: float) -> tuple:
         """Build the Venmo payment card with a direct deep link button."""
+        venmo_handle_clean = VENMO_HANDLE.lstrip('@')
         venmo_url = (
-            f"https://venmo.com/u/{VENMO_HANDLE}"
+            f"https://venmo.com/u/{venmo_handle_clean}"
             f"?txn=pay&amount={amount:.2f}&note=Soccer%20game"
         )
         text = (
