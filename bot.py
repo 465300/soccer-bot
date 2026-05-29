@@ -87,6 +87,7 @@ class SoccerBotV2:
         self.application = None
         self._processing = False
         self._pending_teams: dict[str, str] = {}  # key -> prebuilt teams message text
+        self._pending_cancels: dict[str, str] = {}  # key -> cancel group message text
         self._pending_late_arrivals: dict[int, dict] = {}  # admin_id -> {poll_id, chat_id, players_list}
         self.init_database()
 
@@ -2232,9 +2233,11 @@ class SoccerBotV2:
                 await self.application.bot.send_message(chat_id=chat_id, text="⚠️ Teams message expired. Use /maketeams to regenerate.")
 
         elif action == 'cancel':
+            cancel_key = f"{poll_id}:{chat_id}"
+            cancel_msg = self._pending_cancels.pop(cancel_key, "❌ *Game cancelled.*")
             await self.application.bot.send_message(
                 chat_id=chat_id,
-                text="❌ *Quick poll has been cancelled!*",
+                text=cancel_msg,
                 parse_mode='Markdown'
             )
         
@@ -2685,11 +2688,13 @@ class SoccerBotV2:
         for voter in in_voters:
             self.credit_wallet(voter, VOTE_COST, f"quickpoll_cancelled:{poll_id}")
 
+        refund_line = f"💰 {len(in_voters)} player(s) — your money is safe, refunded ${VOTE_COST:.0f} each." if in_voters else ""
         group_text = (
-            f"❌ *Game poll cancelled.*\n\n"
-            f"📢 Reason: {reason}\n\n"
-            f"💸 {len(in_voters)} player(s) have been refunded ${VOTE_COST:.0f} each."
+            f"❌ *Game cancelled.*\n\n"
+            f"📢 {reason}"
+            + (f"\n\n{refund_line}" if refund_line else "")
         )
+        self._pending_cancels[f"{poll_id}:{chat_id}"] = group_text
         await self.request_approval(
             admin_id,
             group_text,
