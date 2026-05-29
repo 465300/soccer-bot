@@ -2688,7 +2688,7 @@ class SoccerBotV2:
         for voter in in_voters:
             self.credit_wallet(voter, VOTE_COST, f"quickpoll_cancelled:{poll_id}")
 
-        refund_line = f"💰 {len(in_voters)} player(s) — your money is safe, refunded ${VOTE_COST:.0f} each." if in_voters else ""
+        refund_line = "💰 Full refund done — your money is safe." if in_voters else ""
         group_text = (
             f"❌ *Game cancelled.*\n\n"
             f"📢 {reason}"
