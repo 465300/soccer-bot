@@ -77,9 +77,9 @@ ADMIN_COMMANDS = {
     'quickpoll', 'cancelquickpoll', 'closepoll', 'maketeams',
     'setskill', 'skills', 'deleteskill',
     'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats',
-    'sendvenmolink', 'wallethistory', 'waive', 'initchats',
+    'sendvenmolink', 'waive', 'initchats',
 }
-SUPER_ADMIN_ONLY_COMMANDS = {'addadmin', 'removeadmin', 'listadmins', 'voidpayment', 'deletepayment', 'adjustbalance'}
+SUPER_ADMIN_ONLY_COMMANDS = {'addadmin', 'removeadmin', 'listadmins', 'voidpayment', 'deletepayment', 'adjustbalance', 'wallethistory'}
 
 
 class SoccerBotV2:
@@ -151,7 +151,6 @@ class SoccerBotV2:
             BotCommand('clearlate', 'Clear all late flags for a poll — /clearlate poll_id'),
             BotCommand('listchats', 'See all the groups you manage'),
             BotCommand('sendvenmolink', 'Push the top-up card to a player — /sendvenmolink @user'),
-            BotCommand('wallethistory', 'Full transaction history for a player — /wallethistory @user'),
             BotCommand('waive', 'One-game wallet bypass for a player — /waive @user'),
             BotCommand('initchats', 'Broadcast wallet setup invite to all your groups'),
         ]
@@ -162,6 +161,7 @@ class SoccerBotV2:
             BotCommand('voidpayment', 'Reverse a payment — /voidpayment <id>'),
             BotCommand('deletepayment', 'Delete a payment record — /deletepayment <id>'),
             BotCommand('adjustbalance', 'Adjust wallet balance — /adjustbalance @user amount'),
+            BotCommand('wallethistory', 'Full transaction history for a player — /wallethistory @user'),
         ]
 
         # Baseline visibility: private users see only player commands; groups see none.
