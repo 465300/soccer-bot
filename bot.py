@@ -78,6 +78,7 @@ ADMIN_COMMANDS = {
     'setskill', 'skills', 'deleteskill',
     'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats',
     'voidpayment', 'deletepayment', 'adjustbalance', 'sendvenmolink',
+    'wallethistory', 'waive', 'initchats',
 }
 SUPER_ADMIN_ONLY_COMMANDS = {'addadmin', 'removeadmin', 'listadmins'}
 
@@ -154,6 +155,9 @@ class SoccerBotV2:
             BotCommand('deletepayment', 'Delete a payment record — /deletepayment <id>'),
             BotCommand('adjustbalance', 'Adjust wallet balance — /adjustbalance @user amount'),
             BotCommand('sendvenmolink', 'Push the top-up card to a player — /sendvenmolink @user'),
+            BotCommand('wallethistory', 'Full transaction history for a player — /wallethistory @user'),
+            BotCommand('waive', 'One-game wallet bypass for a player — /waive @user'),
+            BotCommand('initchats', 'Broadcast wallet setup invite to all your groups'),
         ]
         super_cmds = [
             BotCommand('addadmin', 'Give someone admin access — /addadmin @username'),
@@ -415,6 +419,13 @@ class SoccerBotV2:
             confirmed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             status TEXT DEFAULT 'pending',
             notes TEXT)''')
+        # Waivers table - one-game eligibility bypass granted by admin
+        c.execute('''CREATE TABLE IF NOT EXISTS waivers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT COLLATE NOCASE,
+            granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            used INTEGER DEFAULT 0,
+            used_at TIMESTAMP)''')
         conn.commit()
         conn.close()
 
@@ -1091,6 +1102,98 @@ class SoccerBotV2:
         except Exception as e:
             await self.send(update, f"❌ Could not DM `{raw_username}`: {e}", parse_mode='Markdown')
 
+    async def wallethistory_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/wallethistory <username> — Show full payment history for a player (admin)."""
+        args = context.args
+        if not args:
+            await self.send(update, "Usage: `/wallethistory <username>`", parse_mode='Markdown')
+            return
+        raw_username = args[0].lstrip('@')
+        wallet = self.get_wallet(raw_username)
+        if not wallet:
+            await self.send(update, f"❌ No wallet found for `{raw_username}`.", parse_mode='Markdown')
+            return
+        history = self.get_payment_history(raw_username, limit=50)
+        if not history:
+            await self.send(update, f"No payment history for `{raw_username}`.", parse_mode='Markdown')
+            return
+        lines = [f"💳 *Wallet history — {raw_username}*", f"Current balance: *${wallet['balance']:.2f}*\n"]
+        for h in history:
+            amt = h['amount']
+            sign = "+" if amt >= 0 else "−"
+            label = self._txn_label(h['notes'])
+            when = self._short_date(h['confirmed_date'])
+            status = f" _{h['status']}_" if h['status'] != 'confirmed' else ""
+            lines.append(f"`#{h['id']}` {sign}${abs(amt):.2f}  {label}{status}  _{when}_")
+        await self.send(update, "\n".join(lines), parse_mode='Markdown')
+
+    async def waive_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/waive <username> — Grant a one-game wallet gate bypass (admin)."""
+        args = context.args
+        if not args:
+            await self.send(update, "Usage: `/waive <username>`\n\nGrants the player a one-game bypass — they can vote IN even if their wallet isn't set up or is low.", parse_mode='Markdown')
+            return
+        raw_username = args[0].lstrip('@')
+        now = datetime.now(TZ).isoformat()
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        # Check for existing unused waiver
+        c.execute("SELECT id FROM waivers WHERE LOWER(username) = LOWER(?) AND used = 0", (raw_username,))
+        existing = c.fetchone()
+        if existing:
+            conn.close()
+            await self.send(update,
+                f"⚠️ `{raw_username}` already has an unused waiver (#{existing[0]}).\n"
+                "It will be used on their next IN vote.",
+                parse_mode='Markdown')
+            return
+        c.execute("INSERT INTO waivers (username, granted_at) VALUES (?, ?)", (raw_username, now))
+        waiver_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        await self.send(update,
+            f"✅ *Waiver granted* — #{waiver_id}\n\n"
+            f"Player: `{raw_username}`\n"
+            "They can vote IN on the next poll regardless of wallet status.\n"
+            "Waiver is consumed automatically when they vote IN.",
+            parse_mode='Markdown')
+
+    async def initchats_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/initchats — Broadcast a DM-invite message to all groups you manage."""
+        user_id = update.effective_user.id
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""SELECT cg.chat_id, cg.group_name
+                     FROM chat_groups cg
+                     JOIN chat_admins ca ON cg.chat_id = ca.chat_id
+                     WHERE ca.user_id = ?
+                     ORDER BY cg.group_name""", (user_id,))
+        groups = c.fetchall()
+        conn.close()
+        if not groups:
+            await self.send(update, "❌ No groups found. Add the bot to a group and run /setchat first.")
+            return
+        bot_info = await self.application.bot.get_me()
+        bot_username = bot_info.username
+        msg = (
+            "👋 *Game wallet setup*\n\n"
+            f"To vote IN on game polls, you need a wallet with the bot.\n\n"
+            f"📲 DM @{bot_username} and send /start to get set up — takes 30 seconds.\n\n"
+            "Each game costs $10, charged when you vote IN and refunded if you switch to OUT before the deadline."
+        )
+        sent, failed = 0, 0
+        for chat_id, group_name in groups:
+            try:
+                await self.application.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+                sent += 1
+            except Exception as e:
+                logger.warning(f"initchats: could not send to {group_name} ({chat_id}): {e}")
+                failed += 1
+        summary = f"✅ Message sent to {sent} group{'s' if sent != 1 else ''}."
+        if failed:
+            summary += f" ⚠️ Failed to send to {failed} group{'s' if failed != 1 else ''} (check bot permissions)."
+        await self.send(update, summary)
+
     async def close_quickpoll_buttons(self, chat_id: int, message_id):
         """Remove the in/out/status buttons from a quickpoll message to stop voting."""
         if not message_id:
@@ -1181,6 +1284,7 @@ class SoccerBotV2:
             return
 
         # Switching INTO 'in' — enforce the capacity cap, then the wallet gate
+        active_waiver_id = None
         if vote_type == 'in':
             c.execute("SELECT COUNT(*) FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
             in_count = c.fetchone()[0]
@@ -1190,12 +1294,22 @@ class SoccerBotV2:
                     f"⚽ This game is full — all {max_players} spots are taken.",
                     show_alert=True)
                 return
-            eligible, reason = self.check_wallet_eligible(username)
-            if not eligible:
-                conn.close()
-                await query.answer(reason, show_alert=True)
-                await self.send_topup_prompt(user.id, reason)
-                return
+            # Check for an active admin-granted waiver before enforcing the wallet gate
+            waiver_conn = sqlite3.connect(DB_FILE)
+            wc = waiver_conn.cursor()
+            wc.execute("SELECT id FROM waivers WHERE LOWER(username) = LOWER(?) AND used = 0 LIMIT 1", (username,))
+            waiver_row = wc.fetchone()
+            waiver_conn.close()
+            if waiver_row:
+                active_waiver_id = waiver_row[0]
+            else:
+                active_waiver_id = None
+                eligible, reason = self.check_wallet_eligible(username)
+                if not eligible:
+                    conn.close()
+                    await query.answer(reason, show_alert=True)
+                    await self.send_topup_prompt(user.id, reason)
+                    return
 
         # Record the vote
         c.execute('INSERT OR REPLACE INTO quickpoll_votes (poll_id, user_id, username, vote_type) VALUES (?, ?, ?, ?)',
@@ -1204,18 +1318,42 @@ class SoccerBotV2:
         conn.close()
 
         # Money: charge on entering 'in', refund on leaving 'in'
+        # Waiver skips the charge (and means no refund due on OUT)
         charged = False
+        waiver_used = False
         if old_vote != 'in' and vote_type == 'in':
-            self.deduct_wallet(username, VOTE_COST, f"quickpoll_vote:{poll_id}")
-            charged = True
+            if active_waiver_id:
+                # Consume the waiver — no charge
+                now = datetime.now(TZ).isoformat()
+                wconn = sqlite3.connect(DB_FILE)
+                wc2 = wconn.cursor()
+                wc2.execute("UPDATE waivers SET used = 1, used_at = ? WHERE id = ?", (now, active_waiver_id))
+                wconn.commit()
+                wconn.close()
+                waiver_used = True
+            else:
+                self.deduct_wallet(username, VOTE_COST, f"quickpoll_vote:{poll_id}")
+                charged = True
         elif old_vote == 'in' and vote_type != 'in':
-            self.credit_wallet(username, VOTE_COST, f"quickpoll_refund:{poll_id}")
+            # Only refund if a charge actually exists for this poll
+            rconn = sqlite3.connect(DB_FILE)
+            rc = rconn.cursor()
+            rc.execute("""SELECT 1 FROM payment_confirmations
+                          WHERE LOWER(username) = LOWER(?) AND notes = ? AND amount < 0""",
+                       (username, f"quickpoll_vote:{poll_id}"))
+            was_charged = rc.fetchone() is not None
+            rconn.close()
+            if was_charged:
+                self.credit_wallet(username, VOTE_COST, f"quickpoll_refund:{poll_id}")
 
         # Confirmation popup
         if vote_type == 'in':
-            await query.answer(f"✅ You're IN — ${VOTE_COST:.0f} deducted from your wallet.")
+            if waiver_used:
+                await query.answer("✅ You're IN — waiver used (no charge this time).")
+            else:
+                await query.answer(f"✅ You're IN — ${VOTE_COST:.0f} deducted from your wallet.")
         else:
-            note = f" ${VOTE_COST:.0f} refunded." if old_vote == 'in' else ""
+            note = f" ${VOTE_COST:.0f} refunded." if (old_vote == 'in' and not waiver_used) else ""
             await query.answer(f"❌ You're OUT.{note}")
 
         # Low-balance nudge after a charge
@@ -3026,6 +3164,9 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('deletepayment', self.deletepayment_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('adjustbalance', self.adjustbalance_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('sendvenmolink', self.sendvenmolink_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('wallethistory', self.wallethistory_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('waive', self.waive_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('initchats', self.initchats_cmd, filters=filters.ChatType.PRIVATE))
 
         # Approval callbacks (approve/discard buttons on admin DMs)
         self.application.add_handler(CallbackQueryHandler(self.handle_approval_callback, pattern='^(approve|discard):'))
