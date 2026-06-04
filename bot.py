@@ -76,7 +76,8 @@ PLAYER_COMMANDS = {'wallet', 'topup', 'cashout', 'cancel'}
 ADMIN_COMMANDS = {
     'quickpoll', 'cancelquickpoll', 'closepoll', 'maketeams',
     'setskill', 'skills', 'deleteskill',
-    'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats'
+    'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats',
+    'voidpayment', 'deletepayment', 'adjustbalance', 'sendvenmolink',
 }
 SUPER_ADMIN_ONLY_COMMANDS = {'addadmin', 'removeadmin', 'listadmins'}
 
@@ -149,6 +150,10 @@ class SoccerBotV2:
             BotCommand('removelate', 'Undo a late mark — /removelate poll_id username'),
             BotCommand('clearlate', 'Clear all late flags for a poll — /clearlate poll_id'),
             BotCommand('listchats', 'See all the groups you manage'),
+            BotCommand('voidpayment', 'Reverse a payment — /voidpayment <id>'),
+            BotCommand('deletepayment', 'Delete a payment record — /deletepayment <id>'),
+            BotCommand('adjustbalance', 'Adjust wallet balance — /adjustbalance @user amount'),
+            BotCommand('sendvenmolink', 'Push the top-up card to a player — /sendvenmolink @user'),
         ]
         super_cmds = [
             BotCommand('addadmin', 'Give someone admin access — /addadmin @username'),
@@ -942,6 +947,149 @@ class SoccerBotV2:
                     chat_id=aid, text=text, parse_mode='Markdown')
             except Exception as e:
                 logger.warning(f"Could not notify admin {aid}: {e}")
+
+    # ===== ADMIN ESCAPE HATCHES =====
+
+    async def voidpayment_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/voidpayment <id> — Reverse a payment's financial effect and mark it voided."""
+        args = context.args
+        if not args or not args[0].isdigit():
+            await self.send(update, "Usage: `/voidpayment <payment_id>`\n\nRun /wallet on the player first to find the ID.", parse_mode='Markdown')
+            return
+        payment_id = int(args[0])
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, username, amount, status, notes FROM payment_confirmations WHERE id = ?", (payment_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            await self.send(update, f"❌ No payment found with ID {payment_id}.")
+            return
+        pid, username, amount, status, notes = row
+        if status == 'voided':
+            await self.send(update, f"⚠️ Payment #{pid} is already voided.")
+            return
+        # Reverse the financial effect
+        wallet = self.get_wallet(username)
+        if not wallet:
+            await self.send(update, f"❌ No wallet found for `{username}`. Cannot reverse balance.", parse_mode='Markdown')
+            return
+        reversal = -float(amount)  # opposite sign
+        new_balance = wallet['balance'] + reversal
+        now = datetime.now(TZ).isoformat()
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("UPDATE wallets SET balance = ?, updated_at = ? WHERE LOWER(username) = LOWER(?)",
+                  (new_balance, now, username))
+        c.execute("UPDATE payment_confirmations SET status = 'voided' WHERE id = ?", (payment_id,))
+        c.execute("""INSERT INTO payment_confirmations (username, amount, confirmed_date, status, notes)
+                     VALUES (?, ?, ?, 'confirmed', ?)""",
+                  (username, reversal, now, f"void_of_{payment_id}"))
+        conn.commit()
+        conn.close()
+        direction = "credited" if reversal > 0 else "deducted"
+        await self.send(update,
+            f"✅ *Payment #{pid} voided*\n\n"
+            f"Player: `{username}`\n"
+            f"Original amount: ${float(amount):.2f} ({notes or 'no note'})\n"
+            f"Reversal: ${abs(reversal):.2f} {direction}\n"
+            f"New balance: *${new_balance:.2f}*",
+            parse_mode='Markdown')
+
+    async def deletepayment_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/deletepayment <id> — Delete a payment record. No balance change."""
+        args = context.args
+        if not args or not args[0].isdigit():
+            await self.send(update, "Usage: `/deletepayment <payment_id>`\n\nDeletes the audit record only — does *not* change the wallet balance.", parse_mode='Markdown')
+            return
+        payment_id = int(args[0])
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, username, amount, status, notes FROM payment_confirmations WHERE id = ?", (payment_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            await self.send(update, f"❌ No payment found with ID {payment_id}.")
+            return
+        pid, username, amount, status, notes = row
+        c.execute("DELETE FROM payment_confirmations WHERE id = ?", (payment_id,))
+        conn.commit()
+        conn.close()
+        await self.send(update,
+            f"🗑️ *Payment #{pid} deleted*\n\n"
+            f"Player: `{username}`\n"
+            f"Amount: ${float(amount):.2f} | Status: {status}\n"
+            f"Note: {notes or '—'}\n\n"
+            "Wallet balance was *not* changed.",
+            parse_mode='Markdown')
+
+    async def adjustbalance_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/adjustbalance <username> <amount> — Add or subtract from a player's wallet."""
+        args = context.args
+        if len(args) < 2:
+            await self.send(update, "Usage: `/adjustbalance <username> <amount>`\n\nPositive = add funds, negative = remove funds.\nExample: `/adjustbalance @player 20` or `/adjustbalance @player -10`", parse_mode='Markdown')
+            return
+        raw_username = args[0].lstrip('@')
+        try:
+            amount = round(float(args[1]), 2)
+        except ValueError:
+            await self.send(update, "❌ Amount must be a number (e.g. `20` or `-10`).", parse_mode='Markdown')
+            return
+        if amount == 0:
+            await self.send(update, "❌ Amount can't be zero.")
+            return
+        wallet = self.get_wallet(raw_username)
+        old_balance = wallet['balance'] if wallet else 0.0
+        new_balance = old_balance + amount
+        now = datetime.now(TZ).isoformat()
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        if wallet:
+            c.execute("UPDATE wallets SET balance = ?, updated_at = ? WHERE LOWER(username) = LOWER(?)",
+                      (new_balance, now, raw_username))
+        else:
+            c.execute("INSERT INTO wallets (username, balance, first_paid) VALUES (?, ?, ?)",
+                      (raw_username, new_balance, 0))
+        c.execute("""INSERT INTO payment_confirmations (username, amount, confirmed_date, status, notes)
+                     VALUES (?, ?, ?, 'confirmed', 'admin_adjustment')""",
+                  (raw_username, amount, now))
+        conn.commit()
+        conn.close()
+        sign = "+" if amount > 0 else ""
+        await self.send(update,
+            f"✅ *Balance adjusted*\n\n"
+            f"Player: `{raw_username}`\n"
+            f"Adjustment: {sign}${amount:.2f}\n"
+            f"Old balance: ${old_balance:.2f} → New balance: *${new_balance:.2f}*",
+            parse_mode='Markdown')
+
+    async def sendvenmolink_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/sendvenmolink <username> — DM the top-up card to a player."""
+        args = context.args
+        if not args:
+            await self.send(update, "Usage: `/sendvenmolink <username>`\n\nDMs the top-up card to the player.", parse_mode='Markdown')
+            return
+        raw_username = args[0].lstrip('@')
+        # Look up user_id from wallets table
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM wallets WHERE LOWER(username) = LOWER(?)", (raw_username,))
+        row = c.fetchone()
+        conn.close()
+        user_id = row[0] if row and row[0] else None
+        if not user_id:
+            await self.send(update,
+                f"❌ No Telegram user ID on file for `{raw_username}`.\n\n"
+                "They need to have DM'd the bot at least once (e.g. `/start` or `/wallet`) before you can push them a message.",
+                parse_mode='Markdown')
+            return
+        text, keyboard = self.build_topup_card()
+        try:
+            await self.application.bot.send_message(
+                chat_id=user_id, text=text, reply_markup=keyboard, parse_mode='Markdown')
+            await self.send(update, f"✅ Top-up card sent to `{raw_username}`.", parse_mode='Markdown')
+        except Exception as e:
+            await self.send(update, f"❌ Could not DM `{raw_username}`: {e}", parse_mode='Markdown')
 
     async def close_quickpoll_buttons(self, chat_id: int, message_id):
         """Remove the in/out/status buttons from a quickpoll message to stop voting."""
@@ -2874,6 +3022,10 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('closepoll', self.closepoll_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('wallet', self.wallet_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('topup', self.topup_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('voidpayment', self.voidpayment_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('deletepayment', self.deletepayment_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('adjustbalance', self.adjustbalance_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('sendvenmolink', self.sendvenmolink_cmd, filters=filters.ChatType.PRIVATE))
 
         # Approval callbacks (approve/discard buttons on admin DMs)
         self.application.add_handler(CallbackQueryHandler(self.handle_approval_callback, pattern='^(approve|discard):'))
