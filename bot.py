@@ -3,6 +3,7 @@ Soccer Bot v2 - Season-based poll automation with webhook + DB scheduling
 """
 
 import os
+import html
 import json
 import asyncio
 import logging
@@ -78,6 +79,7 @@ ADMIN_COMMANDS = {
     'setskill', 'skills', 'deleteskill',
     'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats',
     'sendvenmolink', 'waive', 'initchats',
+    'addplayer', 'removeplayer',
 }
 SUPER_ADMIN_ONLY_COMMANDS = {'addadmin', 'removeadmin', 'listadmins', 'voidpayment', 'deletepayment', 'adjustbalance', 'wallethistory'}
 
@@ -140,6 +142,8 @@ class SoccerBotV2:
         admin_ops_cmds = [
             BotCommand('quickpoll', 'Set up a game poll for your group'),
             BotCommand('closepoll', 'Close voting and post the final player list'),
+            BotCommand('addplayer', 'Force-add a player to the latest game — /addplayer @user [reason]'),
+            BotCommand('removeplayer', 'Force-remove a player from the latest game — /removeplayer @user'),
             BotCommand('cancelquickpoll', 'Cancel a poll and refund everyone'),
             BotCommand('maketeams', 'Split players into balanced skill-based teams'),
             BotCommand('setskill', 'Set a player\'s skill rating — /setskill Name 1-10'),
@@ -363,6 +367,12 @@ class SoccerBotV2:
             pass
         try:
             c.execute("ALTER TABLE quickpolls ADD COLUMN time_end TEXT")
+        except:
+            pass
+        # UX-2: closed flag — drives the live-roster "🔒 closed" banner and
+        # the admin-only override on buttons after a poll ends
+        try:
+            c.execute("ALTER TABLE quickpolls ADD COLUMN closed INTEGER DEFAULT 0")
         except:
             pass
         # Add member_type column for regular/drop-in players
@@ -1209,15 +1219,192 @@ class SoccerBotV2:
             summary += f" ⚠️ Failed to send to {failed} group{'s' if failed != 1 else ''} (check bot permissions)."
         await self.send(update, summary)
 
-    async def close_quickpoll_buttons(self, chat_id: int, message_id):
-        """Remove the in/out/status buttons from a quickpoll message to stop voting."""
-        if not message_id:
+    # ── UX-2: live-roster rendering helpers ───────────────────────────────
+    def _esc(self, s) -> str:
+        """HTML-escape dynamic text (names, locations) for the roster card."""
+        return html.escape(str(s if s is not None else ''), quote=False)
+
+    def _circled(self, n: int) -> str:
+        """Pretty circled numeral for roster lines (① ② … up to 50)."""
+        if 1 <= n <= 20:
+            return chr(0x2460 + n - 1)      # ①..⑳
+        if 21 <= n <= 35:
+            return chr(0x3251 + n - 21)     # ㉑..㉟
+        if 36 <= n <= 50:
+            return chr(0x32B1 + n - 36)     # ㊱..㊿
+        return f"{n}."
+
+    def _capacity_bar(self, current: int, maximum: int, segments: int = 10) -> str:
+        """Unicode progress bar ▰▱ scaled to the IN/max ratio."""
+        if not maximum or maximum <= 0:
+            return ''
+        filled = round(segments * min(current / maximum, 1.0))
+        if current > 0 and filled == 0:
+            filled = 1                       # show at least a sliver once anyone's IN
+        if current < maximum and filled == segments:
+            filled = segments - 1            # never look full until actually full
+        return '▰' * filled + '▱' * (segments - filled)
+
+    def _pretty_date(self, game_date: str) -> str:
+        """2026-06-05 → 'Thursday, Jun 05' (falls back to the raw string)."""
+        if not game_date:
+            return "TBD"
+        try:
+            return datetime.strptime(game_date, '%Y-%m-%d').strftime('%A, %b %d')
+        except (ValueError, TypeError):
+            return game_date
+
+    def _mention(self, name, user_id) -> str:
+        """Clickable mention that works even for users without a public @handle."""
+        disp = self._esc(name or 'player')
+        if user_id:
+            return f'<a href="tg://user?id={user_id}">{disp}</a>'
+        return disp
+
+    def quickpoll_keyboard(self, poll_id: int) -> InlineKeyboardMarkup:
+        """IN/OUT buttons for a quickpoll (the STATUS button is gone — the
+        message itself is now the live status)."""
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ IN", callback_data=f"qvote_{poll_id}_in"),
+            InlineKeyboardButton("❌ OUT", callback_data=f"qvote_{poll_id}_out"),
+        ]])
+
+    def render_quickpoll_message(self, poll_id: int, closed: bool = None) -> str:
+        """Build the live-roster card (HTML) for a quickpoll. Single source of
+        truth, reused on send and on every vote."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""SELECT location_name, location_link, game_date, time_start,
+                            time_end, max_players, deadline_time, closed
+                     FROM quickpolls WHERE id = ?""", (poll_id,))
+        p = c.fetchone()
+        if not p:
+            conn.close()
+            return None
+        (location_name, location_link, game_date, time_start, time_end,
+         max_players, deadline_iso, closed_flag) = p
+        c.execute("""SELECT username, vote_type, user_id FROM quickpoll_votes
+                     WHERE poll_id = ? ORDER BY voted_at ASC, id ASC""", (poll_id,))
+        rows = c.fetchall()
+        conn.close()
+
+        # Closed = explicit flag OR deadline already passed (so the card flips
+        # to the closed banner even before the scheduled close event fires)
+        if closed is None:
+            closed = bool(closed_flag)
+            if not closed and deadline_iso:
+                try:
+                    dl = datetime.fromisoformat(deadline_iso)
+                    if dl.tzinfo is None:
+                        dl = TZ.localize(dl)
+                    if datetime.now(TZ) > dl:
+                        closed = True
+                except (ValueError, TypeError):
+                    pass
+
+        ins = [(u, uid) for (u, vt, uid) in rows if vt == 'in']
+        outs = [(u, uid) for (u, vt, uid) in rows if vt == 'out']
+        in_count, out_count = len(ins), len(outs)
+        max_players = max_players or 0
+        DIV = "━" * 21
+
+        lines = [f"⚽️  <b>MATCH DAY</b>  {'🔒' if closed else '⚽️'}", DIV]
+
+        if location_link:
+            lines.append(f'📍 <a href="{self._esc(location_link)}">{self._esc(location_name)}</a>')
+        else:
+            lines.append(f"📍 {self._esc(location_name)}")
+
+        time_part = ''
+        if time_start and time_end:
+            time_part = f"   🕕 {self._esc(time_start)}–{self._esc(time_end)}"
+        elif time_start:
+            time_part = f"   🕕 {self._esc(time_start)}"
+        lines.append(f"🗓️ {self._esc(self._pretty_date(game_date))}{time_part}")
+
+        if closed:
+            lines.append("🔒 Voting closed")
+        elif deadline_iso:
+            try:
+                dl = datetime.fromisoformat(deadline_iso)
+                lines.append(f"⏳ Closes {dl.strftime('%b %d, %I:%M %p')}")
+            except (ValueError, TypeError):
+                pass
+
+        if max_players:
+            bar = self._capacity_bar(in_count, max_players)
+            if in_count >= max_players:
+                status = "FULL SQUAD 🔥"
+            else:
+                spots = max_players - in_count
+                status = f"{spots} spot{'s' if spots != 1 else ''} left"
+            lines.append("")
+            lines.append(f"{bar}   {in_count}/{max_players}  ·  {status}")
+
+        lines.append("")
+        lines.append(f"✅ <b>IN — {in_count}</b>")
+        for i, (name, uid) in enumerate(ins, 1):
+            lines.append(f"{self._circled(i)}  {self._mention(name, uid)}")
+
+        lines.append("")
+        lines.append(f"❌ <b>OUT — {out_count}</b>")
+        for i, (name, uid) in enumerate(outs, 1):
+            lines.append(f"{self._circled(i)}  {self._mention(name, uid)}")
+
+        lines.append("")
+        lines.append(DIV)
+        if closed:
+            lines.append(f"💵 ${VOTE_COST:.0f}/game · 🔒 closed — admins can still adjust the roster")
+        else:
+            lines.append(f"💵 ${VOTE_COST:.0f}/game · switch to OUT before deadline = full refund")
+
+        return "\n".join(lines)
+
+    async def refresh_quickpoll_message(self, poll_id: int):
+        """Re-render and edit the pinned roster message in place."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT chat_id, poll_message_id FROM quickpolls WHERE id = ?", (poll_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row or not row[1]:
+            return
+        chat_id, message_id = row
+        text = self.render_quickpoll_message(poll_id)
+        if not text:
             return
         try:
-            await self.application.bot.edit_message_reply_markup(
-                chat_id=chat_id, message_id=message_id, reply_markup=None)
+            await self.application.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text,
+                parse_mode='HTML', disable_web_page_preview=True,
+                reply_markup=self.quickpoll_keyboard(poll_id))
         except Exception as e:
-            logger.warning(f"Could not close quickpoll buttons ({message_id}): {e}")
+            if 'not modified' not in str(e).lower():
+                logger.warning(f"Could not refresh quickpoll message {message_id}: {e}")
+
+    async def close_quickpoll_buttons(self, chat_id: int, message_id):
+        """Close a quickpoll: mark it closed and flip the card to the closed
+        banner. Buttons stay visible — process_quickpoll_vote gates them so only
+        admins/super-admin can still adjust the roster after the deadline."""
+        if not message_id:
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id FROM quickpolls WHERE poll_message_id = ?", (message_id,))
+        row = c.fetchone()
+        if row:
+            c.execute("UPDATE quickpolls SET closed = 1 WHERE id = ?", (row[0],))
+            conn.commit()
+        conn.close()
+        if row:
+            await self.refresh_quickpoll_message(row[0])
+        else:
+            # Legacy poll with no stored id — fall back to removing the buttons
+            try:
+                await self.application.bot.edit_message_reply_markup(
+                    chat_id=chat_id, message_id=message_id, reply_markup=None)
+            except Exception as e:
+                logger.warning(f"Could not close quickpoll buttons ({message_id}): {e}")
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -1255,25 +1442,37 @@ class SoccerBotV2:
             id INTEGER PRIMARY KEY, poll_id INTEGER, user_id INTEGER, username TEXT, vote_type TEXT,
             voted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(poll_id, user_id))''')
 
-        # Poll must still exist and be open
-        c.execute("SELECT deadline_time, max_players FROM quickpolls WHERE id = ?", (poll_id,))
+        # Poll must still exist
+        c.execute("SELECT deadline_time, max_players, chat_id, closed FROM quickpolls WHERE id = ?", (poll_id,))
         prow = c.fetchone()
         if not prow:
             conn.close()
             await query.answer("This poll no longer exists.", show_alert=True)
             return
         max_players = prow[1]
-        if prow[0]:
+        poll_chat_id = prow[2]
+
+        # Closed = explicit flag OR deadline passed. Once closed, the buttons stay
+        # visible but only admins/super-admin may still adjust the roster (the
+        # "someone got stuck in traffic" override). Regular voters are rejected.
+        closed = bool(prow[3])
+        if not closed and prow[0]:
             try:
                 deadline = datetime.fromisoformat(prow[0])
                 if deadline.tzinfo is None:
                     deadline = TZ.localize(deadline)
                 if datetime.now(TZ) > deadline:
-                    conn.close()
-                    await query.answer("⏰ Voting has closed for this poll.", show_alert=True)
-                    return
+                    closed = True
             except (ValueError, TypeError):
                 pass
+        is_privileged = False
+        if closed:
+            is_privileged = (self.is_super_admin(user.id)
+                             or self.is_admin(user.id, poll_chat_id, username))
+            if not is_privileged:
+                conn.close()
+                await query.answer("⏰ Voting has closed for this poll.", show_alert=True)
+                return
 
         # Late-arrival block — players blocked from this poll cannot vote
         c.execute("""SELECT 1 FROM late_arrivals
@@ -1303,7 +1502,8 @@ class SoccerBotV2:
         if vote_type == 'in':
             c.execute("SELECT COUNT(*) FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
             in_count = c.fetchone()[0]
-            if max_players and in_count >= max_players:
+            # Privileged admins can exceed the cap when overriding a closed poll
+            if max_players and in_count >= max_players and not is_privileged:
                 conn.close()
                 await query.answer(
                     f"⚽ This game is full — all {max_players} spots are taken.",
@@ -1395,6 +1595,9 @@ class SoccerBotV2:
                         parse_mode='Markdown')
                 except Exception as e:
                     logger.warning(f"Could not send low-balance nudge to {user.id}: {e}")
+
+        # UX-2: redraw the pinned roster card with the new vote
+        await self.refresh_quickpoll_message(poll_id)
 
     async def show_quickpoll_status(self, query, poll_id: int):
         """Show status of a quick poll"""
@@ -2311,25 +2514,42 @@ class SoccerBotV2:
             parse_mode='Markdown', disable_web_page_preview=True
         )
 
-        # Send the poll as an inline-button message (reply to the info message)
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("in", callback_data=f"qvote_{poll_id}_in"),
-            InlineKeyboardButton("out", callback_data=f"qvote_{poll_id}_out"),
-            InlineKeyboardButton("status", callback_data=f"qstatus_{poll_id}"),
-        ]])
-        poll_text = (
-            f"⚽ *Are you playing on {game_date}?*\n\n"
-            f"Tap *in* or *out* below. Each game costs ${VOTE_COST:.0f} from your "
-            "wallet — switch to *out* anytime before the deadline for a full refund.\n\n"
-            "Tap *status* to see the current count."
-        )
+        # Persist the poll first so the live-roster renderer can read it
+        # (poll_message_id is back-filled once the roster message is sent)
+        deadline_iso = deadline_time.isoformat() if deadline_time else None
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''INSERT INTO quickpolls (id, location_name, location_link, max_players, deadline_time, num_teams, chat_id, admin_id, telegram_poll_id, poll_message_id, game_date, time_start, time_end)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  (poll_id, location_name, location_link, max_players, deadline_iso, num_teams, chat_id, admin_id,
+                   None, None, game_date, time_start, time_end))
+
+        # Link any pending late arrivals from previous polls to this new poll
+        # (auto-link for next poll feature)
+        c.execute("""UPDATE late_arrivals SET blocked_from_poll_id = ?
+                     WHERE blocked_from_poll_id IS NULL AND cleared_at IS NULL""",
+                  (poll_id,))
+
+        conn.commit()
+        conn.close()
+
+        # Send the live-roster message (UX-2) — starts empty, edited on every vote
         poll_msg = await self.application.bot.send_message(
             chat_id=chat_id,
-            text=poll_text,
-            parse_mode='Markdown',
-            reply_markup=keyboard,
+            text=self.render_quickpoll_message(poll_id),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+            reply_markup=self.quickpoll_keyboard(poll_id),
             reply_to_message_id=info_msg.message_id,
         )
+
+        # Back-fill the message id so future votes can edit it in place
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("UPDATE quickpolls SET poll_message_id = ? WHERE id = ?",
+                  (poll_msg.message_id, poll_id))
+        conn.commit()
+        conn.close()
 
         # Auto-pin the poll
         try:
@@ -2338,25 +2558,7 @@ class SoccerBotV2:
             )
         except Exception as e:
             logger.warning(f"Could not pin poll: {e}")
-        
-        # Store poll info
-        deadline_iso = deadline_time.isoformat() if deadline_time else None
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('''INSERT INTO quickpolls (id, location_name, location_link, max_players, deadline_time, num_teams, chat_id, admin_id, telegram_poll_id, poll_message_id, game_date, time_start, time_end)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (poll_id, location_name, location_link, max_players, deadline_iso, num_teams, chat_id, admin_id,
-                   None, poll_msg.message_id, game_date, time_start, time_end))
-        
-        # Link any pending late arrivals from previous polls to this new poll
-        # (auto-link for next poll feature)
-        c.execute("""UPDATE late_arrivals SET blocked_from_poll_id = ? 
-                     WHERE blocked_from_poll_id IS NULL AND cleared_at IS NULL""",
-                  (poll_id,))
-        
-        conn.commit()
-        conn.close()
-        
+
         return poll_id
 
     async def resolve_chat_context(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2677,6 +2879,150 @@ class SoccerBotV2:
         # Post the roster (goes to admin approval unless force_send=True)
         await self.post_roster(poll_id, chat_id)
         await self.send(update, "✅ Poll closed! Check your DMs to approve and post the roster.")
+
+    # ── UX-2: admin override — add/remove any player after the deadline ────
+    def resolve_user_id(self, username: str):
+        """Best-effort username→user_id (for a clickable mention). Looks at
+        wallets first, then any prior vote. None if we've never seen them."""
+        clean = (username or '').lstrip('@')
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM wallets WHERE LOWER(username) = LOWER(?) AND user_id IS NOT NULL", (clean,))
+        row = c.fetchone()
+        if not row:
+            c.execute("""SELECT user_id FROM quickpoll_votes
+                         WHERE LOWER(username) = LOWER(?) AND user_id IS NOT NULL
+                         ORDER BY id DESC LIMIT 1""", (clean,))
+            row = c.fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    def latest_poll_for_admin(self, user_id: int):
+        """The most recent quickpoll in any chat this user administers.
+        Returns (poll_id, chat_id, max_players) or None."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""SELECT qp.id, qp.chat_id, qp.max_players FROM quickpolls qp
+                     JOIN chat_admins ca ON qp.chat_id = ca.chat_id
+                     WHERE ca.user_id = ?
+                     ORDER BY qp.created_at DESC LIMIT 1""", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        return row
+
+    async def notify_super_admin_override(self, admin, target: str, poll_id: int, reason: str):
+        """DM the super-admin the full picture when a force-add skipped the
+        charge (low/no balance). The initiating admin never sees these details."""
+        if not SUPER_ADMIN_ID:
+            return
+        wallet = self.get_wallet(target)
+        if wallet:
+            wstate = f"balance ${wallet['balance']:.2f}, first\\_paid={'yes' if wallet['first_paid'] else 'no'}"
+        else:
+            wstate = "no wallet on file"
+        admin_name = (f"@{admin.username}" if admin.username else (admin.first_name or str(admin.id))).replace('_', '\\_')
+        safe_target = target.replace('_', '\\_')
+        when = datetime.now(TZ).strftime('%b %d, %Y %I:%M %p')
+        text = (
+            f"🛡️ *Admin override — charge skipped*\n\n"
+            f"*Admin:* {admin_name} (`{admin.id}`)\n"
+            f"*Player added:* @{safe_target}\n"
+            f"*Game:* poll #{poll_id}\n"
+            f"*When:* {when}\n"
+            f"*Reason:* {reason or '—'}\n"
+            f"*Wallet:* {wstate}\n\n"
+            f"⚠️ ${VOTE_COST:.0f} was *not* charged (insufficient balance). Player added to the roster anyway."
+        )
+        try:
+            await self.application.bot.send_message(chat_id=SUPER_ADMIN_ID, text=text, parse_mode='Markdown')
+        except Exception as e:
+            logger.warning(f"Could not DM super-admin override notice: {e}")
+
+    async def addplayer_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin override: force-add a player IN to the latest poll, even after
+        it closes. Charges $10 like a normal vote; if the wallet can't cover it,
+        the player is added anyway and the super-admin is notified."""
+        user = update.effective_user
+        if not context.args:
+            await self.send(update, "Usage: /addplayer @username [reason]")
+            return
+        target = context.args[0].lstrip('@')
+        reason = ' '.join(context.args[1:]).strip()
+        poll = self.latest_poll_for_admin(user.id)
+        if not poll:
+            await self.send(update, "❌ No recent poll found to adjust.")
+            return
+        poll_id = poll[0]
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, vote_type FROM quickpoll_votes WHERE poll_id = ? AND LOWER(username) = LOWER(?)",
+                  (poll_id, target))
+        erow = c.fetchone()
+        if erow and erow[1] == 'in':
+            conn.close()
+            await self.send(update, f"ℹ️ @{target} is already IN for this game.")
+            return
+        target_uid = self.resolve_user_id(target)
+        if erow:
+            c.execute("UPDATE quickpoll_votes SET vote_type = 'in', user_id = COALESCE(user_id, ?) WHERE id = ?",
+                      (target_uid, erow[0]))
+        else:
+            c.execute("INSERT INTO quickpoll_votes (poll_id, user_id, username, vote_type) VALUES (?, ?, ?, 'in')",
+                      (poll_id, target_uid, target))
+        conn.commit()
+        conn.close()
+
+        # Charge like a normal IN vote; skip (and escalate) if balance can't cover
+        charged = self.deduct_wallet(target, VOTE_COST, f"quickpoll_vote:{poll_id}")
+        if not charged:
+            await self.notify_super_admin_override(user, target, poll_id, reason)
+
+        await self.refresh_quickpoll_message(poll_id)
+        await self.send(update, f"✅ @{target} added IN.")
+
+    async def removeplayer_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin override: force-remove a player from the latest poll, even
+        after it closes. Refunds the $10 if they had been charged."""
+        user = update.effective_user
+        if not context.args:
+            await self.send(update, "Usage: /removeplayer @username [reason]")
+            return
+        target = context.args[0].lstrip('@')
+        poll = self.latest_poll_for_admin(user.id)
+        if not poll:
+            await self.send(update, "❌ No recent poll found to adjust.")
+            return
+        poll_id = poll[0]
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, vote_type FROM quickpoll_votes WHERE poll_id = ? AND LOWER(username) = LOWER(?)",
+                  (poll_id, target))
+        erow = c.fetchone()
+        if not erow:
+            conn.close()
+            await self.send(update, f"ℹ️ @{target} isn't on this poll.")
+            return
+        was_in = erow[1] == 'in'
+        c.execute("DELETE FROM quickpoll_votes WHERE id = ?", (erow[0],))
+        conn.commit()
+        conn.close()
+
+        # Refund only if a charge for this poll actually exists
+        if was_in:
+            rconn = sqlite3.connect(DB_FILE)
+            rc = rconn.cursor()
+            rc.execute("""SELECT 1 FROM payment_confirmations
+                          WHERE LOWER(username) = LOWER(?) AND notes = ? AND amount < 0""",
+                       (target, f"quickpoll_vote:{poll_id}"))
+            was_charged = rc.fetchone() is not None
+            rconn.close()
+            if was_charged:
+                self.credit_wallet(target, VOTE_COST, f"quickpoll_refund:{poll_id}")
+
+        await self.refresh_quickpoll_message(poll_id)
+        await self.send(update, f"✅ @{target} removed.")
 
     async def finalize_teams(self, poll_id: int, chat_id: int, admin_id: int):
         """Called at deadline - creates balanced teams and posts to group"""
@@ -3197,6 +3543,8 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('clearlate', self.clearlate_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('maketeams', self.maketeams_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('closepoll', self.closepoll_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('addplayer', self.addplayer_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('removeplayer', self.removeplayer_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('wallet', self.wallet_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('topup', self.topup_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('voidpayment', self.voidpayment_cmd, filters=filters.ChatType.PRIVATE))
