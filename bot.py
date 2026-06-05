@@ -2917,8 +2917,19 @@ class SoccerBotV2:
         logger.info("Bot starting up, processing pending events...")
         await self.refresh_command_scopes()
         await self.process_pending_events()
-        asyncio.create_task(self.periodic_event_check())
+        self._periodic_task = asyncio.create_task(self.periodic_event_check())
         logger.info("Bot startup complete.")
+
+    async def on_shutdown(self, application):
+        """Post-stop hook: cancel the background checker before the loop closes."""
+        task = getattr(self, '_periodic_task', None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Bot shutdown complete.")
 
     # ===== CANCELLATION COMMANDS =====
 
@@ -3028,7 +3039,7 @@ class SoccerBotV2:
         else:
             role = 'player'
 
-        greeting = "سلام گل گلاب\! بذار بهت بگم چطوری میتونم در خدمتت باشم 🙌\n\n"
+        greeting = "سلام گل گلاب\\! بذار بهت بگم چطوری میتونم در خدمتت باشم 🙌\n\n"
         if role == 'super':
             body = (
                 "*👑 Group Management:*\n"
@@ -3040,13 +3051,13 @@ class SoccerBotV2:
                 "/quickpoll — Create a game poll for your group\n"
                 "/closepoll — Close voting early and send the final lineup for approval\n"
                 "/cancelquickpoll — Cancel a poll and refund everyone automatically\n"
-                "/maketeams — Split voted\-in players into balanced teams\n"
+                "/maketeams — Split voted\\-in players into balanced teams\n"
                 "/setskill, /skills, /deleteskill — Manage skill ratings for fair team splits\n\n"
                 "*💰 Your Wallet:*\n"
                 "/wallet — Check your balance and recent activity\n"
                 "/topup — Add funds to join games\n"
                 "/cashout — Withdraw to Venmo\n\n"
-                "Just send /quickpoll to get started\."
+                "Just send /quickpoll to get started\\."
             )
         elif role == 'admin':
             body = (
@@ -3054,20 +3065,20 @@ class SoccerBotV2:
                 "/quickpoll — Create a game poll for your group\n"
                 "/closepoll — Close voting early and send the final lineup for approval\n"
                 "/cancelquickpoll — Cancel a poll and refund everyone automatically\n"
-                "/maketeams — Split voted\-in players into balanced teams\n"
+                "/maketeams — Split voted\\-in players into balanced teams\n"
                 "/setskill, /skills, /deleteskill — Manage skill ratings for fair team splits\n\n"
                 "*💰 Your Wallet:*\n"
                 "/wallet — Check your balance and recent activity\n"
                 "/topup — Add funds to join games\n"
                 "/cashout — Withdraw to Venmo\n\n"
-                "Just send /quickpoll to get started\."
+                "Just send /quickpoll to get started\\."
             )
         else:
             body = (
-                "💰 /wallet — Check your balance and recent game activity\.\n"
-                "💳 /topup — Add funds to your wallet so you can vote in on games\. Each game costs $10\.\n"
-                "💸 /cashout — Withdraw your balance back to Venmo anytime\.\n\n"
-                "When there's a game poll in your group, tap *IN* to join — $10 is deducted from your wallet\. Switch to *OUT* before the deadline to get it back\."
+                "💰 /wallet — Check your balance and recent game activity\\.\n"
+                "💳 /topup — Add funds to your wallet so you can vote in on games\\. Each game costs $10\\.\n"
+                "💸 /cashout — Withdraw your balance back to Venmo anytime\\.\n\n"
+                "When there's a game poll in your group, tap *IN* to join — $10 is deducted from your wallet\\. Switch to *OUT* before the deadline to get it back\\."
             )
         await self.send(update, greeting + body, parse_mode='MarkdownV2')
 
@@ -3075,9 +3086,9 @@ class SoccerBotV2:
         """Warm reply for unexpected messages in private chat."""
         import random
         responses = [
-            "Hmm, not sure what to do with that one\! Try /wallet to check your balance or /topup to add funds\.",
-            "That one went over my head\! Here's what I'm good at: /wallet, /topup, /cashout — give one of those a go\.",
-            "Not quite my language, but I've got your back for the important stuff\. Start with /wallet to see where things stand\.",
+            "Hmm, not sure what to do with that one\\! Try /wallet to check your balance or /topup to add funds\\.",
+            "That one went over my head\\! Here's what I'm good at: /wallet, /topup, /cashout — give one of those a go\\.",
+            "Not quite my language, but I've got your back for the important stuff\\. Start with /wallet to see where things stand\\.",
         ]
         await self.send(update, random.choice(responses), parse_mode='MarkdownV2')
 
@@ -3089,7 +3100,7 @@ class SoccerBotV2:
     
     def run(self):
         persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
-        self.application = Application.builder().token(self.token).persistence(persistence).post_init(self.on_startup).build()
+        self.application = Application.builder().token(self.token).persistence(persistence).post_init(self.on_startup).post_stop(self.on_shutdown).build()
 
         # Group command deletion handler (must be first to delete commands before processing)
         self.application.add_handler(MessageHandler(
