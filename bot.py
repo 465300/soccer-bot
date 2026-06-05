@@ -424,7 +424,12 @@ class SoccerBotV2:
             username TEXT COLLATE NOCASE,
             granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             used INTEGER DEFAULT 0,
-            used_at TIMESTAMP)''')
+            used_at TIMESTAMP,
+            granted_by TEXT)''')
+        try:
+            c.execute("ALTER TABLE waivers ADD COLUMN granted_by TEXT")
+        except:
+            pass
         conn.commit()
         conn.close()
 
@@ -688,6 +693,7 @@ class SoccerBotV2:
         c.execute("""SELECT id, amount, payment_date, confirmed_date, status, notes
                     FROM payment_confirmations
                     WHERE LOWER(username) = LOWER(?)
+                      AND (notes IS NULL OR notes NOT LIKE 'waiver:%')
                     ORDER BY confirmed_date DESC LIMIT ?""",
                  (username, limit))
         rows = c.fetchall()
@@ -781,6 +787,15 @@ class SoccerBotV2:
         self.credit_wallet(username, amount, "topup")
         wallet = self.get_wallet(username)
         balance = wallet['balance'] if wallet else amount
+        # Notify the super admin only (not every group admin)
+        if SUPER_ADMIN_ID:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=SUPER_ADMIN_ID,
+                    text=f"💰 @{username} topped up *${amount:.2f}* — balance now *${balance:.2f}*.",
+                    parse_mode='Markdown')
+            except Exception as e:
+                logger.warning(f"Could not notify super admin of topup by {username}: {e}")
         await query.edit_message_text(
             f"✅ *${amount:.2f} added* — your balance is now *${balance:.2f}*.\n\n"
             "You're set for the next few games. Will nudge you when it's time "
@@ -1133,6 +1148,7 @@ class SoccerBotV2:
             await self.send(update, "Usage: `/waive <username>`\n\nGrants the player a one-game bypass — they can vote IN even if their wallet isn't set up or is low.", parse_mode='Markdown')
             return
         raw_username = args[0].lstrip('@')
+        granter = update.effective_user.username or update.effective_user.first_name
         now = datetime.now(TZ).isoformat()
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -1146,7 +1162,7 @@ class SoccerBotV2:
                 "It will be used on their next IN vote.",
                 parse_mode='Markdown')
             return
-        c.execute("INSERT INTO waivers (username, granted_at) VALUES (?, ?)", (raw_username, now))
+        c.execute("INSERT INTO waivers (username, granted_at, granted_by) VALUES (?, ?, ?)", (raw_username, now, granter))
         waiver_id = c.lastrowid
         conn.commit()
         conn.close()
@@ -1322,11 +1338,24 @@ class SoccerBotV2:
         waiver_used = False
         if old_vote != 'in' and vote_type == 'in':
             if active_waiver_id:
-                # Consume the waiver — no charge
+                # Consume the waiver — no charge. Write a $0 audit row tying the
+                # waiver to the real game it covered + the admin who granted it.
                 now = datetime.now(TZ).isoformat()
                 wconn = sqlite3.connect(DB_FILE)
                 wc2 = wconn.cursor()
                 wc2.execute("UPDATE waivers SET used = 1, used_at = ? WHERE id = ?", (now, active_waiver_id))
+                wc2.execute("SELECT granted_by FROM waivers WHERE id = ?", (active_waiver_id,))
+                grow = wc2.fetchone()
+                granted_by = grow[0] if grow and grow[0] else "unknown"
+                wc2.execute("SELECT location_name, game_date FROM quickpolls WHERE id = ?", (poll_id,))
+                qrow = wc2.fetchone()
+                loc = qrow[0] if qrow else "?"
+                gdate = qrow[1] if qrow and qrow[1] else "?"
+                audit_note = f"waiver:#{poll_id} {gdate} @ {loc} · granted by @{granted_by}"
+                wc2.execute("""INSERT INTO payment_confirmations
+                              (username, amount, confirmed_date, status, notes)
+                              VALUES (?, 0, ?, 'waived', ?)""",
+                           (username, now, audit_note))
                 wconn.commit()
                 wconn.close()
                 waiver_used = True
