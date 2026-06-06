@@ -1265,8 +1265,8 @@ class SoccerBotV2:
         """IN/OUT buttons for a quickpoll (the STATUS button is gone — the
         message itself is now the live status)."""
         return InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ IN", callback_data=f"qvote_{poll_id}_in"),
-            InlineKeyboardButton("❌ OUT", callback_data=f"qvote_{poll_id}_out"),
+            InlineKeyboardButton("IN", callback_data=f"qvote_{poll_id}_in"),
+            InlineKeyboardButton("OUT", callback_data=f"qvote_{poll_id}_out"),
         ]])
 
     def render_quickpoll_message(self, poll_id: int, closed: bool = None) -> str:
@@ -1306,9 +1306,8 @@ class SoccerBotV2:
         outs = [(u, uid) for (u, vt, uid) in rows if vt == 'out']
         in_count, out_count = len(ins), len(outs)
         max_players = max_players or 0
-        DIV = "━" * 21
 
-        lines = [f"⚽️  <b>MATCH DAY</b>  {'🔒' if closed else '⚽️'}", DIV]
+        lines = ["⚽ <b>Soccer Day</b>"]
 
         if location_link:
             lines.append(f'📍 <a href="{self._esc(location_link)}">{self._esc(location_name)}</a>')
@@ -1317,13 +1316,13 @@ class SoccerBotV2:
 
         time_part = ''
         if time_start and time_end:
-            time_part = f"   🕕 {self._esc(time_start)}–{self._esc(time_end)}"
+            time_part = f" · {self._esc(time_start)}–{self._esc(time_end)}"
         elif time_start:
-            time_part = f"   🕕 {self._esc(time_start)}"
-        lines.append(f"🗓️ {self._esc(self._pretty_date(game_date))}{time_part}")
+            time_part = f" · {self._esc(time_start)}"
+        lines.append(f"🕕 {self._esc(self._pretty_date(game_date))}{time_part}")
 
         if closed:
-            lines.append("🔒 Voting closed")
+            lines.append("Voting closed — tap IN/OUT to reach an admin")
         elif deadline_iso:
             try:
                 dl = datetime.fromisoformat(deadline_iso)
@@ -1333,13 +1332,8 @@ class SoccerBotV2:
 
         if max_players:
             bar = self._capacity_bar(in_count, max_players)
-            if in_count >= max_players:
-                status = "FULL SQUAD 🔥"
-            else:
-                spots = max_players - in_count
-                status = f"{spots} spot{'s' if spots != 1 else ''} left"
             lines.append("")
-            lines.append(f"{bar}   {in_count}/{max_players}  ·  {status}")
+            lines.append(f"{bar}   {in_count}/{max_players} max")
 
         lines.append("")
         lines.append(f"✅ <b>IN — {in_count}</b>")
@@ -1352,11 +1346,10 @@ class SoccerBotV2:
             lines.append(f"{self._circled(i)}  {self._mention(name, uid)}")
 
         lines.append("")
-        lines.append(DIV)
         if closed:
-            lines.append(f"💵 ${VOTE_COST:.0f}/game · 🔒 closed — admins can still adjust the roster")
+            lines.append(f"${VOTE_COST:.0f}/game")
         else:
-            lines.append(f"💵 ${VOTE_COST:.0f}/game · switch to OUT before deadline = full refund")
+            lines.append(f"${VOTE_COST:.0f}/game · switch to OUT before deadline = full refund")
 
         return "\n".join(lines)
 
@@ -1405,6 +1398,37 @@ class SoccerBotV2:
                     chat_id=chat_id, message_id=message_id, reply_markup=None)
             except Exception as e:
                 logger.warning(f"Could not close quickpoll buttons ({message_id}): {e}")
+
+    def get_group_admins(self, chat_id: int):
+        """Return [(username, user_id), ...] for a group's registered admins."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT username, user_id FROM chat_admins WHERE chat_id = ?", (chat_id,))
+        rows = c.fetchall()
+        conn.close()
+        return rows
+
+    async def dm_closed_poll_contact(self, user_id: int, chat_id: int):
+        """After a poll closes, any tap (player, admin, or super-admin) records no
+        vote — the tapper just gets a DM pointing them to the group's admin(s).
+        The roster is only changed via /addplayer and /removeplayer."""
+        mentions = []
+        for username, uid in self.get_group_admins(chat_id):
+            if uid and username:
+                mentions.append(f'<a href="tg://user?id={uid}">@{self._esc(username)}</a>')
+            elif username:
+                mentions.append(f"@{self._esc(username)}")
+        if mentions:
+            text = (f"Voting's closed for that game. To get in or out, "
+                    f"message an admin: {', '.join(mentions)}")
+        else:
+            text = "Voting's closed for that game. Please contact a group admin to get in or out."
+        try:
+            await self.application.bot.send_message(
+                chat_id=user_id, text=text, parse_mode='HTML',
+                disable_web_page_preview=True)
+        except Exception as e:
+            logger.warning(f"Could not DM closed-poll contact to {user_id}: {e}")
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -1465,14 +1489,14 @@ class SoccerBotV2:
                     closed = True
             except (ValueError, TypeError):
                 pass
-        is_privileged = False
         if closed:
-            is_privileged = (self.is_super_admin(user.id)
-                             or self.is_admin(user.id, poll_chat_id, username))
-            if not is_privileged:
-                conn.close()
-                await query.answer("⏰ Voting has closed for this poll.", show_alert=True)
-                return
+            # Closed = nobody votes via buttons (players, admins, super-admin all
+            # alike). The tapper gets a DM with the group's admin handles; roster
+            # changes only happen through /addplayer and /removeplayer.
+            conn.close()
+            await query.answer()
+            await self.dm_closed_poll_contact(user.id, poll_chat_id)
+            return
 
         # Late-arrival block — players blocked from this poll cannot vote
         c.execute("""SELECT 1 FROM late_arrivals
@@ -1502,8 +1526,7 @@ class SoccerBotV2:
         if vote_type == 'in':
             c.execute("SELECT COUNT(*) FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
             in_count = c.fetchone()[0]
-            # Privileged admins can exceed the cap when overriding a closed poll
-            if max_players and in_count >= max_players and not is_privileged:
+            if max_players and in_count >= max_players:
                 conn.close()
                 await query.answer(
                     f"⚽ This game is full — all {max_players} spots are taken.",
@@ -2496,24 +2519,6 @@ class SoccerBotV2:
         
         poll_id = int(datetime.now().timestamp())
 
-        msg = f"""⚽ *Soccer session at {location_name}*
-📍 [Click for directions]({location_link})
-🗓️ {game_date} | {time_start} - {time_end}
-👥 Max: {max_players} players"""
-
-        if deadline_time:
-            deadline_str = deadline_time.strftime('%b %d at %I:%M %p')
-            msg += f"""
-
-⏳ Voting closes: {deadline_str}
-❌ Miss it = Miss the game!"""
-
-        # Send info message
-        info_msg = await self.application.bot.send_message(
-            chat_id=chat_id, text=msg,
-            parse_mode='Markdown', disable_web_page_preview=True
-        )
-
         # Persist the poll first so the live-roster renderer can read it
         # (poll_message_id is back-filled once the roster message is sent)
         deadline_iso = deadline_time.isoformat() if deadline_time else None
@@ -2540,7 +2545,6 @@ class SoccerBotV2:
             parse_mode='HTML',
             disable_web_page_preview=True,
             reply_markup=self.quickpoll_keyboard(poll_id),
-            reply_to_message_id=info_msg.message_id,
         )
 
         # Back-fill the message id so future votes can edit it in place
