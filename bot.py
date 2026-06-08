@@ -68,6 +68,11 @@ VOTE_COST = 10.00      # charged per IN vote, refunded on switch to OUT
 WALLET_FLOOR = 10.00   # minimum balance required to vote IN
 TOPUP_MIN = 20.00      # minimum custom top-up amount
 
+# UX-3: how many hours before the deadline to auto-nudge non-voters.
+# Only intervals that still land in the future are scheduled, so short
+# deadlines naturally skip the earlier nudges.
+NUDGE_INTERVALS_HOURS = (24, 12, 2)
+
 # Super-admin controls: only this user can manage admin lifecycle
 _raw_super_admin_id = os.getenv('SUPER_ADMIN_ID', '').strip()
 SUPER_ADMIN_ID = int(_raw_super_admin_id) if _raw_super_admin_id.isdigit() else 0
@@ -79,7 +84,7 @@ ADMIN_COMMANDS = {
     'setskill', 'skills', 'deleteskill',
     'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats',
     'sendvenmolink', 'waive', 'initchats',
-    'addplayer', 'removeplayer',
+    'addplayer', 'removeplayer', 'nudge',
 }
 SUPER_ADMIN_ONLY_COMMANDS = {'addadmin', 'removeadmin', 'listadmins', 'voidpayment', 'deletepayment', 'adjustbalance', 'wallethistory'}
 
@@ -145,6 +150,7 @@ class SoccerBotV2:
             BotCommand('closepoll', 'Close voting and post the final player list'),
             BotCommand('addplayer', 'Force-add a player to the latest game — /addplayer @user [reason]'),
             BotCommand('removeplayer', 'Force-remove a player from the latest game — /removeplayer @user'),
+            BotCommand('nudge', 'Ping members who haven\'t voted yet — /nudge [poll_id]'),
             BotCommand('cancelquickpoll', 'Cancel a poll and refund everyone'),
             BotCommand('maketeams', 'Split players into balanced skill-based teams'),
             BotCommand('setskill', 'Set a player\'s skill rating — /setskill Name 1-10'),
@@ -564,6 +570,18 @@ class SoccerBotV2:
         self.schedule_event('announce_late_arrivals', announce_time, {
             'poll_id': poll_id, 'chat_id': chat_id, 'admin_id': admin_id
         })
+
+    def schedule_nudge_events(self, poll_id: int, chat_id: int, deadline_time: datetime):
+        """UX-3: schedule non-voter nudges before the deadline. Only intervals
+        that still fall in the future are scheduled (short deadlines skip the
+        earlier ones)."""
+        now = datetime.now(TZ)
+        for hours_before in NUDGE_INTERVALS_HOURS:
+            fire_time = deadline_time - timedelta(hours=hours_before)
+            if fire_time > now:
+                self.schedule_event('nudge_nonvoters', fire_time, {
+                    'poll_id': poll_id, 'chat_id': chat_id
+                })
 
     async def check_admin(self, update: Update) -> tuple[bool, int | None]:
         """Check if user is admin for current chat. Returns (is_admin, chat_id)"""
@@ -2531,7 +2549,10 @@ class SoccerBotV2:
             self.schedule_event('close_quickpoll', deadline_time, {
                 'poll_id': poll_id, 'chat_id': chat_id
             })
-            
+
+            # Schedule non-voter nudges at -24h / -12h / -2h (UX-3)
+            self.schedule_nudge_events(poll_id, chat_id, deadline_time)
+
             # Schedule late arrivals events (prompt at game_start - 5min, announce at game_start + 2hrs)
             game_start_time = self.parse_game_datetime(qp['date'], qp['time_start'])
             if game_start_time:
@@ -2956,6 +2977,97 @@ class SoccerBotV2:
         conn.close()
         return row
 
+    def get_nonvoters(self, poll_id: int):
+        """UX-3: members who have NOT cast any vote (IN or OUT) on this poll.
+        Members are global; matching is case-insensitive."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT username FROM members")
+        members = [r[0] for r in c.fetchall() if r[0]]
+        c.execute("SELECT username FROM quickpoll_votes WHERE poll_id = ?", (poll_id,))
+        voted = {r[0].lower() for r in c.fetchall() if r[0]}
+        conn.close()
+        return [m for m in members if m.lower() not in voted]
+
+    async def _send_nudge_message(self, chat_id: int, usernames):
+        """Tag a list of non-voters in the group, chunked to stay well under
+        Telegram's message limit."""
+        header = "⏳ <b>Game's coming up — we haven't heard from you!</b>\nTap <b>IN</b> or <b>OUT</b> on the poll above 👆"
+        CHUNK = 30
+        for i in range(0, len(usernames), CHUNK):
+            batch = usernames[i:i + CHUNK]
+            mentions = ' '.join(f"@{self._esc(u)}" for u in batch)
+            text = f"{header}\n\n{mentions}" if i == 0 else mentions
+            try:
+                await self.application.bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode='HTML',
+                    disable_web_page_preview=True)
+            except Exception as e:
+                logger.error(f"Nudge send failed for chat {chat_id}: {e}")
+
+    async def nudge_nonvoters(self, poll_id: int, chat_id: int, respect_closed: bool = True) -> int:
+        """UX-3: tag members who haven't voted at all. Scheduled nudges pass
+        respect_closed=True so a closed/cancelled poll is a no-op; manual
+        /nudge passes respect_closed=False. Returns how many were tagged."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT closed FROM quickpolls WHERE id = ?", (poll_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            logger.info(f"Nudge skipped: poll {poll_id} no longer exists")
+            return 0
+        if respect_closed and row[0]:
+            logger.info(f"Nudge skipped: poll {poll_id} is closed")
+            return 0
+        nonvoters = self.get_nonvoters(poll_id)
+        if not nonvoters:
+            return 0
+        await self._send_nudge_message(chat_id, nonvoters)
+        return len(nonvoters)
+
+    async def nudge_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin command: fire a non-voter nudge immediately. /nudge [poll_id]
+        — with no arg, targets the admin's most recent poll. No usage limit."""
+        user = update.effective_user
+        if context.args:
+            try:
+                poll_id = int(context.args[0])
+            except ValueError:
+                await self.send(update, "Usage: /nudge [poll_id]")
+                return
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("""SELECT qp.chat_id FROM quickpolls qp
+                         JOIN chat_admins ca ON qp.chat_id = ca.chat_id
+                         WHERE qp.id = ? AND ca.user_id = ?""", (poll_id, user.id))
+            row = c.fetchone()
+            conn.close()
+            if not row:
+                await self.send(update, "❌ No poll with that ID in a group you manage.")
+                return
+            chat_id = row[0]
+        else:
+            poll = self.latest_poll_for_admin(user.id)
+            if not poll:
+                await self.send(update, "❌ No recent poll found to nudge.")
+                return
+            poll_id, chat_id = poll[0], poll[1]
+
+        count = await self.nudge_nonvoters(poll_id, chat_id, respect_closed=False)
+        if count:
+            await self.send(update, f"✅ Nudged {count} non-voter(s) in the group.")
+        else:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM members")
+            has_members = c.fetchone()[0] > 0
+            conn.close()
+            if has_members:
+                await self.send(update, "🎉 Everyone's already voted — no one to nudge.")
+            else:
+                await self.send(update, "ℹ️ No members on file to nudge. Add some with /addmember.")
+
     async def notify_super_admin_override(self, admin, target: str, poll_id: int, reason: str):
         """DM the super-admin the full picture when a force-add skipped the
         charge (low/no balance). The initiating admin never sees these details."""
@@ -3283,6 +3395,8 @@ class SoccerBotV2:
                         await self.prompt_late_arrivals(payload['poll_id'], payload['chat_id'], payload['admin_id'])
                     elif event_type == 'announce_late_arrivals':
                         await self.announce_late_arrivals(payload['poll_id'], payload['chat_id'], payload['admin_id'])
+                    elif event_type == 'nudge_nonvoters':
+                        await self.nudge_nonvoters(payload['poll_id'], payload['chat_id'])
                 except Exception as e:
                     logger.error(f"Error processing event {event_id} ({event_type}): {e}")
 
@@ -3378,7 +3492,7 @@ class SoccerBotV2:
         c = conn.cursor()
 
         # Cancel pending deadline events for this poll
-        c.execute("SELECT id, payload FROM scheduled_events WHERE event_type IN ('finalize_teams', 'close_quickpoll') AND executed = 0")
+        c.execute("SELECT id, payload FROM scheduled_events WHERE event_type IN ('finalize_teams', 'close_quickpoll', 'nudge_nonvoters') AND executed = 0")
         for eid, payload_json in c.fetchall():
             payload = json.loads(payload_json)
             if payload.get('poll_id') == poll_id:
@@ -3591,6 +3705,7 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('closepoll', self.closepoll_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('addplayer', self.addplayer_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('removeplayer', self.removeplayer_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('nudge', self.nudge_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('wallet', self.wallet_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('topup', self.topup_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('voidpayment', self.voidpayment_cmd, filters=filters.ChatType.PRIVATE))
