@@ -207,11 +207,13 @@ class SoccerBotV2:
             linked = c.rowcount
             conn.commit()
             conn.close()
-        # Only spend a network call when we just learned their ID or are forced.
-        if not (force or linked):
-            return
         player_cmds, admin_ops_cmds, super_cmds = self._command_menus()
         role = self._role_for(user)
+        # Push the menu if: we just back-filled their ID, or they're an admin
+        # (user_id may have been back-filled via a group vote, leaving linked=0
+        # but the per-user admin menu never set), or explicitly forced.
+        if not (force or linked or role in ('super', 'admin')):
+            return
         if role == 'super':
             menu = super_cmds + admin_ops_cmds + player_cmds
         elif role == 'admin':
@@ -2284,10 +2286,6 @@ class SoccerBotV2:
         if SUPER_ADMIN_ID:
             c.execute("INSERT OR IGNORE INTO chat_admins (chat_id, user_id, username) VALUES (?, ?, ?)",
                       (chat_id, SUPER_ADMIN_ID, None))
-        # Also register whoever added the bot, if different
-        if added_by and added_by.id != SUPER_ADMIN_ID:
-            c.execute("INSERT OR IGNORE INTO chat_admins (chat_id, user_id, username) VALUES (?, ?, ?)",
-                      (chat_id, added_by.id, added_by.username))
         conn.commit()
         conn.close()
 
