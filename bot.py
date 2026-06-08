@@ -88,6 +88,7 @@ ADMIN_COMMANDS = {
     'addmember', 'removemember', 'members',
     # Admins get everything except the money commands below.
     'addadmin', 'removeadmin', 'listadmins', 'wallethistory',
+    'switchgroup', 'mygroups',
 }
 # Money commands stay super-admin-only (super admin's personal Venmo account).
 SUPER_ADMIN_ONLY_COMMANDS = {'voidpayment', 'deletepayment', 'adjustbalance'}
@@ -136,6 +137,39 @@ class SoccerBotV2:
         conn.close()
         return False
 
+    def get_admin_target_chat(self, user_id: int) -> tuple:
+        """Return (chat_id, group_name) from the admin's saved active group, or (None, None)."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""SELECT aac.chat_id, cg.group_name
+                     FROM admin_active_chat aac
+                     JOIN chat_groups cg ON aac.chat_id = cg.chat_id
+                     WHERE aac.user_id = ?""", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return row[0], row[1]
+        # Auto-select if only one group exists
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT chat_id, group_name FROM chat_groups")
+        groups = c.fetchall()
+        conn.close()
+        if len(groups) == 1:
+            return groups[0][0], groups[0][1]
+        return None, None
+
+    def set_admin_target_chat(self, user_id: int, chat_id: int):
+        """Save the admin's active group choice."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO admin_active_chat (user_id, chat_id) VALUES (?, ?)", (user_id, chat_id))
+        conn.commit()
+        conn.close()
+
+    def _group_header(self, group_name: str) -> str:
+        return f"📍 {group_name} · /switchgroup to change\n\n"
+
     def _command_menus(self):
         """The three role-based Telegram command menus. Admins get everything
         the super admin does EXCEPT the money commands (super-only)."""
@@ -164,6 +198,8 @@ class SoccerBotV2:
             BotCommand('addlate', 'Mark a player as late — /addlate poll_id username'),
             BotCommand('removelate', 'Undo a late mark — /removelate poll_id username'),
             BotCommand('clearlate', 'Clear all late flags for a poll — /clearlate poll_id'),
+            BotCommand('switchgroup', 'Choose which group to target with commands'),
+            BotCommand('mygroups', 'See all groups you manage'),
             BotCommand('listchats', 'See all the groups you manage'),
             BotCommand('sendvenmolink', 'Push the top-up card to a player — /sendvenmolink @user'),
             BotCommand('waive', 'One-game wallet bypass for a player — /waive @user'),
@@ -214,6 +250,22 @@ class SoccerBotV2:
         # but the per-user admin menu never set), or explicitly forced.
         if not (force or linked or role in ('super', 'admin')):
             return
+        # DM the admin their group info the first time we push their menu
+        if linked and role in ('super', 'admin'):
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("SELECT group_name FROM chat_groups ORDER BY group_name")
+                gnames = [r[0] for r in c.fetchall()]
+                conn.close()
+                if gnames:
+                    group_list = ", ".join(gnames)
+                    await self.application.bot.send_message(
+                        chat_id=user.id,
+                        text=f"👋 You have admin access to: *{group_list}*\n\nUse /switchgroup to choose which group your commands target.",
+                        parse_mode='Markdown')
+            except Exception:
+                pass
         if role == 'super':
             menu = super_cmds + admin_ops_cmds + player_cmds
         elif role == 'admin':
@@ -451,7 +503,12 @@ class SoccerBotV2:
             user_id INTEGER,
             username TEXT,
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            added_by INTEGER,
             PRIMARY KEY (chat_id, user_id))''')
+        try:
+            c.execute("ALTER TABLE chat_admins ADD COLUMN added_by INTEGER")
+        except:
+            pass
         # Migration: purge rows where chat_id is positive (DM/private context, not a group)
         c.execute("DELETE FROM chat_admins WHERE chat_id > 0")
         # Migration: ensure super-admin is in chat_admins for all existing groups
@@ -503,6 +560,15 @@ class SoccerBotV2:
             granted_by TEXT)''')
         try:
             c.execute("ALTER TABLE waivers ADD COLUMN granted_by TEXT")
+        except:
+            pass
+        # Active group selection per admin — persists across restarts
+        c.execute('''CREATE TABLE IF NOT EXISTS admin_active_chat (
+            user_id INTEGER PRIMARY KEY,
+            chat_id INTEGER)''')
+        # Display-name-only members (no Telegram username, can't be @-pinged)
+        try:
+            c.execute("ALTER TABLE members ADD COLUMN is_display_name INTEGER DEFAULT 0")
         except:
             pass
         conn.commit()
@@ -1557,6 +1623,9 @@ class SoccerBotV2:
         if query.data.startswith('ctopup:'):
             await self.confirm_topup(query, float(query.data.split(':', 1)[1]))
             return
+        if query.data.startswith('sg:'):
+            await self.handle_switchgroup_callback(query, query.data.split(':', 1)[1])
+            return
 
         data = query.data.split('_')
 
@@ -1768,60 +1837,108 @@ class SoccerBotV2:
 
         await query.answer(f"📊 Your vote: {my_vote_str}\n\nIN: {in_count} | OUT: {out_count} | Total: {in_count}/{max_players}", show_alert=True)
 
+    async def switchgroup_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show all registered groups as inline buttons; tapping one sets the active group."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT chat_id, group_name FROM chat_groups ORDER BY group_name")
+        groups = c.fetchall()
+        conn.close()
+        if not groups:
+            await self.send(update, "❌ No groups registered yet. Add the bot to a group first.")
+            return
+        if len(groups) == 1:
+            self.set_admin_target_chat(update.effective_user.id, groups[0][0])
+            await self.send(update, f"✅ Active group: *{groups[0][1]}*", parse_mode='Markdown')
+            return
+        buttons = [[InlineKeyboardButton(name, callback_data=f"sg:{chat_id}")]
+                   for chat_id, name in groups]
+        await self.send(update, "Choose your active group:",
+                        reply_markup=InlineKeyboardMarkup(buttons))
+
+    async def handle_switchgroup_callback(self, query, chat_id_str: str):
+        """Handle inline button tap from /switchgroup."""
+        try:
+            chat_id = int(chat_id_str)
+        except ValueError:
+            await query.answer("Invalid group.")
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT group_name FROM chat_groups WHERE chat_id = ?", (chat_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            await query.answer("Group not found.")
+            return
+        self.set_admin_target_chat(query.from_user.id, chat_id)
+        await query.edit_message_text(f"✅ Active group: *{row[0]}*\n\nAll commands now target this group.",
+                                      parse_mode='Markdown')
+        await query.answer()
+
+    async def mygroups_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List all registered groups, marking the admin's active one."""
+        user_id = update.effective_user.id
+        active_chat_id, _ = self.get_admin_target_chat(user_id)
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT chat_id, group_name FROM chat_groups ORDER BY group_name")
+        groups = c.fetchall()
+        conn.close()
+        if not groups:
+            await self.send(update, "❌ No groups registered yet.")
+            return
+        lines = []
+        for cid, name in groups:
+            marker = "✅" if cid == active_chat_id else "•"
+            lines.append(f"{marker} *{name}*")
+        text = "📋 *Your groups:*\n\n" + "\n".join(lines)
+        if len(groups) > 1:
+            text += "\n\n/switchgroup to change target"
+        await self.send(update, text, parse_mode='Markdown')
+
     async def addadmin_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Add an admin for the current chat: /addadmin @username or /addadmin user_id"""
-        # Any admin can manage admins (money commands stay super-only).
-        if not self._role_for(update.effective_user) in ('super', 'admin'):
+        """Add an admin across all groups: /addadmin @username or /addadmin user_id"""
+        caller = update.effective_user
+        if not self._role_for(caller) in ('super', 'admin'):
             await self.send(update, "❌ You are not authorized to use this command.")
             return
-        
+
         if not context.args:
             await self.send(update, "Usage: /addadmin @username or /addadmin <user_id>")
             return
-        
-        # Get current chat_id from settings
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key = 'chat_id'")
-        chat_result = c.fetchone()
-        
-        if not chat_result:
-            conn.close()
-            await self.send(update, "❌ No chat set. Add the bot to a group first.")
-            return
-        
-        chat_id = int(chat_result[0])
-
-        if chat_id > 0:
-            conn.close()
-            await self.send(update, "❌ No valid group chat set. Add the bot to a group first.")
-            return
 
         arg = context.args[0].lstrip('@')
-        
-        # Check if it's a user_id (numeric) or username
         try:
             new_admin_id = int(arg)
-            username = arg  # Will use ID as placeholder
+            username = None
         except ValueError:
-            # It's a username — store NULL for user_id; is_admin() will resolve by username
-            # and back-fill the real ID on first interaction
             new_admin_id = None
             username = arg
 
-        c.execute("INSERT OR REPLACE INTO chat_admins (chat_id, user_id, username) VALUES (?, ?, ?)",
-                  (chat_id, new_admin_id, username))
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT chat_id FROM chat_groups")
+        all_groups = [r[0] for r in c.fetchall()]
+        if not all_groups:
+            conn.close()
+            await self.send(update, "❌ No groups registered yet. Add the bot to a group first.")
+            return
+
+        for gid in all_groups:
+            c.execute("INSERT OR IGNORE INTO chat_admins (chat_id, user_id, username, added_by) VALUES (?, ?, ?, ?)",
+                      (gid, new_admin_id, username, caller.id))
         conn.commit()
         conn.close()
         await self.refresh_command_scopes()
-        
-        safe_username = username.replace('_', '\\_')
-        await self.send(update, f"✅ Added admin: {safe_username} for chat {chat_id}")
+
+        safe = (username or str(new_admin_id)).replace('_', '\\_')
+        await self.send(update, f"✅ Added admin: {safe} (access to all {len(all_groups)} group(s))")
 
     async def removeadmin_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Remove an admin from the current chat: /removeadmin @username or /removeadmin user_id"""
-        # Any admin can manage admins (money commands stay super-only).
-        if not self._role_for(update.effective_user) in ('super', 'admin'):
+        """Remove an admin (from all groups): /removeadmin @username or /removeadmin user_id"""
+        caller = update.effective_user
+        if not self._role_for(caller) in ('super', 'admin'):
             await self.send(update, "❌ You are not authorized to use this command.")
             return
 
@@ -1829,38 +1946,49 @@ class SoccerBotV2:
             await self.send(update, "Usage: /removeadmin @username or /removeadmin <user_id>")
             return
 
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key = 'chat_id'")
-        chat_result = c.fetchone()
-
-        if not chat_result:
-            conn.close()
-            await self.send(update, "❌ No chat set. Add the bot to a group first.")
-            return
-
-        chat_id = int(chat_result[0])
         arg = context.args[0].lstrip('@')
 
-        # Safety: the super admin can never be removed by another admin.
-        if SUPER_ADMIN_ID and not self.is_super_admin(update.effective_user.id):
+        # Super admin can never be removed
+        if SUPER_ADMIN_ID:
             if arg == str(SUPER_ADMIN_ID):
-                conn.close()
-                await self.send(update, "❌ You can't remove the super admin.")
-                return
-            c.execute("SELECT user_id FROM chat_admins WHERE chat_id = ? AND LOWER(username) = LOWER(?)", (chat_id, arg))
-            row = c.fetchone()
-            if row and row[0] == SUPER_ADMIN_ID:
-                conn.close()
                 await self.send(update, "❌ You can't remove the super admin.")
                 return
 
-        # Try both user_id and username
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+
+        # Resolve target user_id from arg
         try:
-            user_id = int(arg)
-            c.execute("DELETE FROM chat_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+            target_id = int(arg)
+            target_username = None
         except ValueError:
-            c.execute("DELETE FROM chat_admins WHERE chat_id = ? AND LOWER(username) = LOWER(?)", (chat_id, arg))
+            target_id = None
+            target_username = arg
+
+        # Block removing super admin by username
+        if target_id == SUPER_ADMIN_ID:
+            conn.close()
+            await self.send(update, "❌ You can't remove the super admin.")
+            return
+
+        # Non-super admins can only remove admins they themselves added
+        if not self.is_super_admin(caller.id):
+            if target_id:
+                c.execute("SELECT added_by FROM chat_admins WHERE user_id = ? LIMIT 1", (target_id,))
+            else:
+                c.execute("SELECT added_by FROM chat_admins WHERE LOWER(username) = LOWER(?) LIMIT 1", (target_username,))
+            row = c.fetchone()
+            if not row or row[0] != caller.id:
+                conn.close()
+                await self.send(update, "❌ You can only remove admins that you added.")
+                return
+
+        # Delete from all groups
+        if target_id:
+            c.execute("DELETE FROM chat_admins WHERE user_id = ? AND user_id != ?", (target_id, SUPER_ADMIN_ID or -1))
+        else:
+            c.execute("DELETE FROM chat_admins WHERE LOWER(username) = LOWER(?) AND (user_id IS NULL OR user_id != ?)",
+                      (target_username, SUPER_ADMIN_ID or -1))
 
         if c.rowcount == 0:
             conn.close()
@@ -1884,30 +2012,20 @@ class SoccerBotV2:
         
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key = 'chat_id'")
-        chat_result = c.fetchone()
-        
-        if not chat_result:
-            conn.close()
-            await self.send(update, "❌ No chat set. Add the bot to a group first.")
-            return
-        
-        chat_id = int(chat_result[0])
-        c.execute("SELECT user_id, username FROM chat_admins WHERE chat_id = ?", (chat_id,))
+        c.execute("SELECT DISTINCT user_id, username, added_by FROM chat_admins WHERE user_id != ? OR user_id IS NULL",
+                  (SUPER_ADMIN_ID or -1,))
         admins = c.fetchall()
         conn.close()
-        
+
         if not admins:
-            await self.send(update, f"No admins set for chat {chat_id}. Use /addadmin to add one.")
+            await self.send(update, "No admins set yet. Use /addadmin to add one.")
             return
-        
-        text = f"*🔐 Admins for chat {chat_id}:*\n"
-        for user_id, username in admins:
+
+        text = "*🔐 Admins:*\n"
+        for uid, username, added_by in admins:
             label = (username or '').replace('_', '\\_') or '(no username)'
-            if user_id and user_id != 0:
-                text += f"• {label} (ID: {user_id})\n"
-            else:
-                text += f"• {label}\n"
+            suffix = f" (ID: {uid})" if uid and uid != 0 else ""
+            text += f"• {label}{suffix}\n"
 
         await self.send(update, text, parse_mode='Markdown')
 
@@ -2206,19 +2324,11 @@ class SoccerBotV2:
         
         # Balance teams using greedy algorithm
         teams = self.balance_teams(players_with_skills, num_teams)
-        
-        # Get group chat
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key = 'chat_id'")
-        chat_result = c.fetchone()
-        conn.close()
-        
-        if not chat_result:
-            await self.send(update, "❌ No chat set. Add the bot to a group first.")
+
+        chat_id, group_name = self.get_admin_target_chat(update.effective_user.id)
+        if not chat_id:
+            await self.send(update, "❌ No active group set. Run /switchgroup first.")
             return
-        
-        chat_id = int(chat_result[0])
         
         # Build and send message
         msg = "⚽ *Teams for Today's Game*\n\n"
@@ -2378,6 +2488,7 @@ class SoccerBotV2:
             selected_chat_id, selected_name = groups[choice]
             context.user_data['qp']['target_chat_id'] = selected_chat_id
             context.user_data['qp']['target_group_name'] = selected_name
+            self.set_admin_target_chat(update.effective_user.id, selected_chat_id)
 
         except ValueError:
             await self.send(update, "❌ Please enter a valid number.")
@@ -2744,29 +2855,12 @@ class SoccerBotV2:
         if update.effective_chat.type in ['group', 'supergroup']:
             return update.effective_chat.id, None
             
-        # 3. Private context fallback (most recent)
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("""
-            SELECT ca.chat_id 
-            FROM chat_admins ca
-            JOIN chat_groups cg ON ca.chat_id = cg.chat_id
-            WHERE ca.user_id = ?
-            ORDER BY ca.added_at DESC LIMIT 1
-        """, (user_id,))
-        res = c.fetchone()
-        
-        # Global fallback (legacy)
-        if not res:
-             c.execute("SELECT value FROM settings WHERE key = 'chat_id'")
-             res = c.fetchone()
-             
-        conn.close()
-        
-        if res:
-            return int(res[0]), None
-            
-        return None, "❌ No chat context found. Add the bot to a group first, or specify a group name."
+        # 3. Private context — use admin's saved active group
+        chat_id, _ = self.get_admin_target_chat(user_id)
+        if chat_id:
+            return chat_id, None
+
+        return None, "❌ No active group set. Run /switchgroup to choose a group."
 
     async def handle_late_arrivals_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle admin's response to late arrivals prompt"""
@@ -3054,37 +3148,41 @@ class SoccerBotV2:
         return row
 
     async def addmember_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Add one or more players to the nudge roster: /addmember @a @b …
-        The roster is the list /nudge pings — standalone, not season-related."""
+        """Add players to the nudge roster. @username for pingable; plain name for no-username players."""
         if not context.args:
-            await self.send(update, "Usage: /addmember @user [@user2 …]")
+            await self.send(update, "Usage: /addmember @username or /addmember First\\ Last")
             return
-        added, existing = [], []
+        added_ping, added_display, existing = [], [], []
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         for raw in context.args:
+            is_display = not raw.startswith('@')
             name = raw.lstrip('@').strip()
             if not name:
                 continue
             c.execute("SELECT 1 FROM members WHERE LOWER(username) = LOWER(?)", (name,))
             if c.fetchone():
-                existing.append(name)
+                existing.append((name, is_display))
             else:
-                c.execute("INSERT INTO members (username, first_name) VALUES (?, ?)", (name, name))
-                added.append(name)
+                c.execute("INSERT INTO members (username, first_name, is_display_name) VALUES (?, ?, ?)",
+                          (name, name, 1 if is_display else 0))
+                (added_display if is_display else added_ping).append(name)
         conn.commit()
         conn.close()
         lines = []
-        if added:
-            lines.append("✅ Added: " + ", ".join(f"@{n}" for n in added))
+        if added_ping:
+            lines.append("✅ Added: " + ", ".join(f"@{n}" for n in added_ping))
+        if added_display:
+            lines.append("✅ Added (no username — won't be pinged): " + ", ".join(added_display))
         if existing:
-            lines.append("ℹ️ Already on the roster: " + ", ".join(f"@{n}" for n in existing))
+            lines.append("ℹ️ Already on roster: " + ", ".join(
+                n if dn else f"@{n}" for n, dn in existing))
         await self.send(update, "\n".join(lines) or "Nothing to add.")
 
     async def removemember_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Remove one or more players from the nudge roster: /removemember @a @b …"""
+        """Remove players from the nudge roster: /removemember @username or /removemember Name"""
         if not context.args:
-            await self.send(update, "Usage: /removemember @user [@user2 …]")
+            await self.send(update, "Usage: /removemember @username or /removemember Name")
             return
         removed, missing = [], []
         conn = sqlite3.connect(DB_FILE)
@@ -3099,47 +3197,53 @@ class SoccerBotV2:
         conn.close()
         lines = []
         if removed:
-            lines.append("✅ Removed: " + ", ".join(f"@{n}" for n in removed))
+            lines.append("✅ Removed: " + ", ".join(removed))
         if missing:
-            lines.append("ℹ️ Not on the roster: " + ", ".join(f"@{n}" for n in missing))
+            lines.append("ℹ️ Not on roster: " + ", ".join(missing))
         await self.send(update, "\n".join(lines) or "Nothing to remove.")
 
     async def members_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show the nudge roster."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT username FROM members ORDER BY LOWER(username)")
-        names = [r[0] for r in c.fetchall() if r[0]]
+        c.execute("SELECT username, is_display_name FROM members ORDER BY LOWER(username)")
+        rows = [(r[0], r[1] or 0) for r in c.fetchall() if r[0]]
         conn.close()
-        if not names:
-            await self.send(update, "ℹ️ The nudge roster is empty. Add players with /addmember @user.")
+        if not rows:
+            await self.send(update, "ℹ️ The nudge roster is empty. Use /addmember to add players.")
             return
-        body = "\n".join(f"{i}. @{n}" for i, n in enumerate(names, 1))
-        await self.send(update, f"👥 Nudge roster ({len(names)}):\n{body}")
+        body = "\n".join(
+            f"{i}. {n} (no username)" if dn else f"{i}. @{n}"
+            for i, (n, dn) in enumerate(rows, 1)
+        )
+        await self.send(update, f"👥 Nudge roster ({len(rows)}):\n{body}")
 
     def get_nonvoters(self, poll_id: int):
         """UX-3: members who have NOT cast any vote (IN or OUT) on this poll.
-        Members are global; matching is case-insensitive."""
+        Returns list of (username, is_display_name)."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         try:
-            c.execute("SELECT username FROM members")
-            members = [r[0] for r in c.fetchall() if r[0]]
+            c.execute("SELECT username, is_display_name FROM members")
+            members = [(r[0], r[1] or 0) for r in c.fetchall() if r[0]]
         except sqlite3.OperationalError:
             members = []
         c.execute("SELECT username FROM quickpoll_votes WHERE poll_id = ?", (poll_id,))
         voted = {r[0].lower() for r in c.fetchall() if r[0]}
         conn.close()
-        return [m for m in members if m.lower() not in voted]
+        return [(name, dn) for name, dn in members if name.lower() not in voted]
 
     async def _send_nudge_message(self, chat_id: int, usernames):
-        """Tag a list of non-voters in the group, chunked to stay well under
-        Telegram's message limit."""
+        """Tag a list of non-voters in the group, chunked to stay under Telegram's limit.
+        usernames is a list of (name, is_display_name) tuples."""
         header = "⏳ <b>Game's coming up — we haven't heard from you!</b>\nTap <b>IN</b> or <b>OUT</b> on the poll above 👆"
         CHUNK = 30
         for i in range(0, len(usernames), CHUNK):
             batch = usernames[i:i + CHUNK]
-            mentions = ' '.join(f"@{self._esc(u)}" for u in batch)
+            mentions = ' '.join(
+                self._esc(name) if is_dn else f"@{self._esc(name)}"
+                for name, is_dn in batch
+            )
             text = f"{header}\n\n{mentions}" if i == 0 else mentions
             try:
                 await self.application.bot.send_message(
@@ -3836,6 +3940,8 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('start', self.start_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('setchat', self.set_chat, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(ChatMemberHandler(self.handle_bot_added_to_group, ChatMemberHandler.MY_CHAT_MEMBER))
+        self.application.add_handler(CommandHandler('switchgroup', self.switchgroup_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('mygroups', self.mygroups_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('addadmin', self.addadmin_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('removeadmin', self.removeadmin_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('listadmins', self.listadmins_cmd, filters=filters.ChatType.PRIVATE))
