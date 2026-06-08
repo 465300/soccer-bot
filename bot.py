@@ -92,6 +92,7 @@ class SoccerBotV2:
         self._pending_teams: dict[str, str] = {}  # key -> prebuilt teams message text
         self._pending_cancels: dict[str, str] = {}  # key -> cancel group message text
         self._pending_late_arrivals: dict[int, dict] = {}  # admin_id -> {poll_id, chat_id, players_list}
+        self._refresh_tasks: dict[int, asyncio.Task] = {}  # poll_id -> pending debounced card-refresh task
         self.init_database()
 
     async def send(self, update: Update, text: str, **kwargs):
@@ -1353,6 +1354,43 @@ class SoccerBotV2:
 
         return "\n".join(lines)
 
+    async def _safe_answer(self, query, text: str = None, show_alert: bool = False):
+        """Answer a callback query, swallowing the 'query is too old / invalid'
+        error Telegram raises once a tap has expired (~15s). Without this, a
+        stale answer would throw and abort the rest of the vote handler."""
+        try:
+            if text is None:
+                await query.answer()
+            else:
+                await query.answer(text, show_alert=show_alert)
+        except Exception as e:
+            logger.debug(f"Callback answer skipped (stale query?): {e}")
+
+    def schedule_quickpoll_refresh(self, poll_id: int, delay: float = 0.4):
+        """Debounced, non-blocking roster refresh.
+
+        Votes only mark the card dirty and return immediately — the actual
+        edit_message_text happens here, out of band. A burst of rapid IN/OUT
+        taps cancels the prior pending refresh and reschedules, so the whole
+        burst collapses into a single edit that renders the final state. This
+        keeps the (sequential) update queue from stalling on the network edit
+        and avoids tripping Telegram's same-message edit flood control."""
+        old = self._refresh_tasks.get(poll_id)
+        if old and not old.done():
+            old.cancel()
+
+        async def _runner():
+            try:
+                await asyncio.sleep(delay)
+                await self.refresh_quickpoll_message(poll_id)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                if self._refresh_tasks.get(poll_id) is asyncio.current_task():
+                    self._refresh_tasks.pop(poll_id, None)
+
+        self._refresh_tasks[poll_id] = asyncio.create_task(_runner())
+
     async def refresh_quickpoll_message(self, poll_id: int):
         """Re-render and edit the pinned roster message in place."""
         conn = sqlite3.connect(DB_FILE)
@@ -1471,7 +1509,7 @@ class SoccerBotV2:
         prow = c.fetchone()
         if not prow:
             conn.close()
-            await query.answer("This poll no longer exists.", show_alert=True)
+            await self._safe_answer(query, "This poll no longer exists.", show_alert=True)
             return
         max_players = prow[1]
         poll_chat_id = prow[2]
@@ -1494,7 +1532,7 @@ class SoccerBotV2:
             # alike). The tapper gets a DM with the group's admin handles; roster
             # changes only happen through /addplayer and /removeplayer.
             conn.close()
-            await query.answer()
+            await self._safe_answer(query)
             await self.dm_closed_poll_contact(user.id, poll_chat_id)
             return
 
@@ -1504,7 +1542,8 @@ class SoccerBotV2:
                      AND cleared_at IS NULL""", (poll_id, username))
         if c.fetchone():
             conn.close()
-            await query.answer(
+            await self._safe_answer(
+                query,
                 "⚠️ You arrived late to the previous game and can't join this poll.",
                 show_alert=True)
             return
@@ -1518,7 +1557,7 @@ class SoccerBotV2:
         # No change — do not re-charge (idempotency)
         if old_vote == vote_type:
             conn.close()
-            await query.answer(f"You already voted {vote_type.upper()}.")
+            await self._safe_answer(query, f"You already voted {vote_type.upper()}.")
             return
 
         # Switching INTO 'in' — enforce the capacity cap, then the wallet gate
@@ -1528,7 +1567,8 @@ class SoccerBotV2:
             in_count = c.fetchone()[0]
             if max_players and in_count >= max_players:
                 conn.close()
-                await query.answer(
+                await self._safe_answer(
+                    query,
                     f"⚽ This game is full — all {max_players} spots are taken.",
                     show_alert=True)
                 return
@@ -1545,7 +1585,7 @@ class SoccerBotV2:
                 eligible, reason = self.check_wallet_eligible(username)
                 if not eligible:
                     conn.close()
-                    await query.answer(reason, show_alert=True)
+                    await self._safe_answer(query, reason, show_alert=True)
                     await self.send_topup_prompt(user.id, reason)
                     return
 
@@ -1600,12 +1640,12 @@ class SoccerBotV2:
         # Confirmation popup
         if vote_type == 'in':
             if waiver_used:
-                await query.answer("✅ You're IN — waiver used (no charge this time).")
+                await self._safe_answer(query, "✅ You're IN — waiver used (no charge this time).")
             else:
-                await query.answer(f"✅ You're IN — ${VOTE_COST:.0f} deducted from your wallet.")
+                await self._safe_answer(query, f"✅ You're IN — ${VOTE_COST:.0f} deducted from your wallet.")
         else:
             note = f" ${VOTE_COST:.0f} refunded." if (old_vote == 'in' and not waiver_used) else ""
-            await query.answer(f"❌ You're OUT.{note}")
+            await self._safe_answer(query, f"❌ You're OUT.{note}")
 
         # Low-balance nudge after a charge
         if charged:
@@ -1619,8 +1659,10 @@ class SoccerBotV2:
                 except Exception as e:
                     logger.warning(f"Could not send low-balance nudge to {user.id}: {e}")
 
-        # UX-2: redraw the pinned roster card with the new vote
-        await self.refresh_quickpoll_message(poll_id)
+        # UX-2: redraw the pinned roster card with the new vote.
+        # Debounced + non-blocking so rapid IN/OUT toggling doesn't stall the
+        # (sequential) update queue or trip Telegram's edit flood control.
+        self.schedule_quickpoll_refresh(poll_id)
 
     async def show_quickpoll_status(self, query, poll_id: int):
         """Show status of a quick poll"""
