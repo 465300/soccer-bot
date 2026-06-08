@@ -1858,12 +1858,18 @@ class SoccerBotV2:
             user_id = int(arg)
             c.execute("DELETE FROM chat_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
         except ValueError:
-            c.execute("DELETE FROM chat_admins WHERE chat_id = ? AND username = ?", (chat_id, arg))
-        
+            c.execute("DELETE FROM chat_admins WHERE chat_id = ? AND LOWER(username) = LOWER(?)", (chat_id, arg))
+
+        if c.rowcount == 0:
+            conn.close()
+            safe_arg = arg.replace('_', '\\_')
+            await self.send(update, f"❌ No admin found with that username/ID: {safe_arg}")
+            return
+
         conn.commit()
         conn.close()
         await self.refresh_command_scopes()
-        
+
         safe_arg = arg.replace('_', '\\_')
         await self.send(update, f"✅ Removed admin: {safe_arg}")
 
