@@ -85,6 +85,7 @@ ADMIN_COMMANDS = {
     'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats',
     'sendvenmolink', 'waive', 'initchats',
     'addplayer', 'removeplayer', 'nudge',
+    'addmember', 'removemember', 'members',
     # Admins get everything except the money commands below.
     'addadmin', 'removeadmin', 'listadmins', 'wallethistory',
 }
@@ -151,6 +152,9 @@ class SoccerBotV2:
             BotCommand('addplayer', 'Force-add a player to the latest game — /addplayer @user [reason]'),
             BotCommand('removeplayer', 'Force-remove a player from the latest game — /removeplayer @user'),
             BotCommand('nudge', 'Ping members who haven\'t voted yet — /nudge [poll_id]'),
+            BotCommand('addmember', 'Add players to the nudge roster — /addmember @user …'),
+            BotCommand('removemember', 'Remove players from the roster — /removemember @user …'),
+            BotCommand('members', 'Show the nudge roster'),
             BotCommand('cancelquickpoll', 'Cancel a poll and refund everyone'),
             BotCommand('maketeams', 'Split players into balanced skill-based teams'),
             BotCommand('setskill', 'Set a player\'s skill rating — /setskill Name 1-10'),
@@ -502,10 +506,13 @@ class SoccerBotV2:
         conn.commit()
         conn.close()
 
-        # Drop legacy season tables (season feature removed)
+        # Drop legacy season tables (season feature removed).
+        # NOTE: 'members' is NOT dropped — it's the standalone nudge roster
+        # (read by get_nonvoters), unrelated to the season feature. Wiping it
+        # every boot is what broke /nudge.
         conn2 = sqlite3.connect(DB_FILE)
         c2 = conn2.cursor()
-        for tbl in ('votes', 'polls', 'members', 'season'):
+        for tbl in ('votes', 'polls', 'season'):
             try:
                 c2.execute(f"DROP TABLE IF EXISTS {tbl}")
             except Exception:
@@ -3042,13 +3049,80 @@ class SoccerBotV2:
         conn.close()
         return row
 
+    async def addmember_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Add one or more players to the nudge roster: /addmember @a @b …
+        The roster is the list /nudge pings — standalone, not season-related."""
+        if not context.args:
+            await self.send(update, "Usage: /addmember @user [@user2 …]")
+            return
+        added, existing = [], []
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        for raw in context.args:
+            name = raw.lstrip('@').strip()
+            if not name:
+                continue
+            c.execute("SELECT 1 FROM members WHERE LOWER(username) = LOWER(?)", (name,))
+            if c.fetchone():
+                existing.append(name)
+            else:
+                c.execute("INSERT INTO members (username, first_name) VALUES (?, ?)", (name, name))
+                added.append(name)
+        conn.commit()
+        conn.close()
+        lines = []
+        if added:
+            lines.append("✅ Added: " + ", ".join(f"@{n}" for n in added))
+        if existing:
+            lines.append("ℹ️ Already on the roster: " + ", ".join(f"@{n}" for n in existing))
+        await self.send(update, "\n".join(lines) or "Nothing to add.")
+
+    async def removemember_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Remove one or more players from the nudge roster: /removemember @a @b …"""
+        if not context.args:
+            await self.send(update, "Usage: /removemember @user [@user2 …]")
+            return
+        removed, missing = [], []
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        for raw in context.args:
+            name = raw.lstrip('@').strip()
+            if not name:
+                continue
+            c.execute("DELETE FROM members WHERE LOWER(username) = LOWER(?)", (name,))
+            (removed if c.rowcount else missing).append(name)
+        conn.commit()
+        conn.close()
+        lines = []
+        if removed:
+            lines.append("✅ Removed: " + ", ".join(f"@{n}" for n in removed))
+        if missing:
+            lines.append("ℹ️ Not on the roster: " + ", ".join(f"@{n}" for n in missing))
+        await self.send(update, "\n".join(lines) or "Nothing to remove.")
+
+    async def members_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show the nudge roster."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT username FROM members ORDER BY LOWER(username)")
+        names = [r[0] for r in c.fetchall() if r[0]]
+        conn.close()
+        if not names:
+            await self.send(update, "ℹ️ The nudge roster is empty. Add players with /addmember @user.")
+            return
+        body = "\n".join(f"{i}. @{n}" for i, n in enumerate(names, 1))
+        await self.send(update, f"👥 Nudge roster ({len(names)}):\n{body}")
+
     def get_nonvoters(self, poll_id: int):
         """UX-3: members who have NOT cast any vote (IN or OUT) on this poll.
         Members are global; matching is case-insensitive."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT username FROM members")
-        members = [r[0] for r in c.fetchall() if r[0]]
+        try:
+            c.execute("SELECT username FROM members")
+            members = [r[0] for r in c.fetchall() if r[0]]
+        except sqlite3.OperationalError:
+            members = []
         c.execute("SELECT username FROM quickpoll_votes WHERE poll_id = ?", (poll_id,))
         voted = {r[0].lower() for r in c.fetchall() if r[0]}
         conn.close()
@@ -3774,6 +3848,9 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('addplayer', self.addplayer_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('removeplayer', self.removeplayer_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('nudge', self.nudge_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('addmember', self.addmember_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('removemember', self.removemember_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('members', self.members_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('wallet', self.wallet_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('topup', self.topup_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('voidpayment', self.voidpayment_cmd, filters=filters.ChatType.PRIVATE))
