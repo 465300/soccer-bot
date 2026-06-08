@@ -85,8 +85,11 @@ ADMIN_COMMANDS = {
     'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats',
     'sendvenmolink', 'waive', 'initchats',
     'addplayer', 'removeplayer', 'nudge',
+    # Admins get everything except the money commands below.
+    'addadmin', 'removeadmin', 'listadmins', 'wallethistory',
 }
-SUPER_ADMIN_ONLY_COMMANDS = {'addadmin', 'removeadmin', 'listadmins', 'voidpayment', 'deletepayment', 'adjustbalance', 'wallethistory'}
+# Money commands stay super-admin-only (super admin's personal Venmo account).
+SUPER_ADMIN_ONLY_COMMANDS = {'voidpayment', 'deletepayment', 'adjustbalance'}
 
 
 class SoccerBotV2:
@@ -132,12 +135,9 @@ class SoccerBotV2:
         conn.close()
         return False
 
-    async def refresh_command_scopes(self):
-        """Apply role-based Telegram command menus.
-        - Members: player commands only
-        - Approved admins: player + admin operations
-        - Super admin: all commands (including admin lifecycle)
-        """
+    def _command_menus(self):
+        """The three role-based Telegram command menus. Admins get everything
+        the super admin does EXCEPT the money commands (super-only)."""
         player_cmds = [
             BotCommand('start', 'Get started / see what I can do'),
             BotCommand('wallet', 'Check your balance and recent activity'),
@@ -164,16 +164,68 @@ class SoccerBotV2:
             BotCommand('sendvenmolink', 'Push the top-up card to a player — /sendvenmolink @user'),
             BotCommand('waive', 'One-game wallet bypass for a player — /waive @user'),
             BotCommand('initchats', 'Broadcast wallet setup invite to all your groups'),
-        ]
-        super_cmds = [
             BotCommand('addadmin', 'Give someone admin access — /addadmin @username'),
             BotCommand('removeadmin', 'Revoke admin access — /removeadmin @username'),
             BotCommand('listadmins', 'See all admins for a group'),
+            BotCommand('wallethistory', 'Full transaction history for a player — /wallethistory @user'),
+        ]
+        super_cmds = [
             BotCommand('voidpayment', 'Reverse a payment — /voidpayment <id>'),
             BotCommand('deletepayment', 'Delete a payment record — /deletepayment <id>'),
             BotCommand('adjustbalance', 'Adjust wallet balance — /adjustbalance @user amount'),
-            BotCommand('wallethistory', 'Full transaction history for a player — /wallethistory @user'),
         ]
+        return player_cmds, admin_ops_cmds, super_cmds
+
+    def _role_for(self, user) -> str:
+        """'super' | 'admin' | 'member' for a Telegram user."""
+        if not user:
+            return 'member'
+        if self.is_super_admin(user.id):
+            return 'super'
+        if self.is_admin_any_chat(user.id, getattr(user, 'username', None)):
+            return 'admin'
+        return 'member'
+
+    async def sync_user_commands(self, user, force: bool = False):
+        """Make sure a user sees the right slash-command menu the moment they
+        interact, and back-fill their user_id into chat_admins. Telegram only
+        accepts a per-user menu once the user has opened a DM with the bot —
+        which they have if they're sending a command/start — so this is where
+        admins added by @username (NULL user_id) finally get their menu."""
+        if not user:
+            return
+        linked = 0
+        if getattr(user, 'username', None):
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("UPDATE chat_admins SET user_id = ? WHERE user_id IS NULL AND LOWER(username) = LOWER(?)",
+                      (user.id, user.username))
+            linked = c.rowcount
+            conn.commit()
+            conn.close()
+        # Only spend a network call when we just learned their ID or are forced.
+        if not (force or linked):
+            return
+        player_cmds, admin_ops_cmds, super_cmds = self._command_menus()
+        role = self._role_for(user)
+        if role == 'super':
+            menu = super_cmds + admin_ops_cmds + player_cmds
+        elif role == 'admin':
+            menu = admin_ops_cmds + player_cmds
+        else:
+            menu = player_cmds
+        try:
+            await self.application.bot.set_my_commands(menu, scope=BotCommandScopeChat(chat_id=user.id))
+        except Exception as e:
+            logger.warning(f"Could not sync commands for user {user.id}: {e}")
+
+    async def refresh_command_scopes(self):
+        """Apply role-based Telegram command menus.
+        - Members: player commands only
+        - Approved admins: player + admin operations
+        - Super admin: all commands (including admin lifecycle)
+        """
+        player_cmds, admin_ops_cmds, super_cmds = self._command_menus()
 
         # Baseline visibility: private users see only player commands; groups see none.
         await self.application.bot.set_my_commands(player_cmds, scope=BotCommandScopeAllPrivateChats())
@@ -244,11 +296,11 @@ class SoccerBotV2:
             return
 
         user = update.effective_user
-        role = 'member'
-        if self.is_super_admin(user.id):
-            role = 'super'
-        elif self.is_admin_any_chat(user.id, user.username):
-            role = 'admin'
+        # Back-fill user_id for @username-added admins and push their menu the
+        # first time we learn their ID — this is what makes a newly-added
+        # admin actually SEE /quickpoll etc.
+        await self.sync_user_commands(user)
+        role = self._role_for(user)
 
         if cmd in SUPER_ADMIN_ONLY_COMMANDS and role != 'super':
             await self.send(update, "❌ Not allowed.")
@@ -1709,8 +1761,8 @@ class SoccerBotV2:
 
     async def addadmin_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Add an admin for the current chat: /addadmin @username or /addadmin user_id"""
-        # Super-admin only: admin lifecycle is centrally controlled.
-        if not self.is_super_admin(update.effective_user.id):
+        # Any admin can manage admins (money commands stay super-only).
+        if not self._role_for(update.effective_user) in ('super', 'admin'):
             await self.send(update, "❌ You are not authorized to use this command.")
             return
         
@@ -1759,28 +1811,41 @@ class SoccerBotV2:
 
     async def removeadmin_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Remove an admin from the current chat: /removeadmin @username or /removeadmin user_id"""
-        # Super-admin only: admin lifecycle is centrally controlled.
-        if not self.is_super_admin(update.effective_user.id):
+        # Any admin can manage admins (money commands stay super-only).
+        if not self._role_for(update.effective_user) in ('super', 'admin'):
             await self.send(update, "❌ You are not authorized to use this command.")
             return
-        
+
         if not context.args:
             await self.send(update, "Usage: /removeadmin @username or /removeadmin <user_id>")
             return
-        
+
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT value FROM settings WHERE key = 'chat_id'")
         chat_result = c.fetchone()
-        
+
         if not chat_result:
             conn.close()
             await self.send(update, "❌ No chat set. Add the bot to a group first.")
             return
-        
+
         chat_id = int(chat_result[0])
         arg = context.args[0].lstrip('@')
-        
+
+        # Safety: the super admin can never be removed by another admin.
+        if SUPER_ADMIN_ID and not self.is_super_admin(update.effective_user.id):
+            if arg == str(SUPER_ADMIN_ID):
+                conn.close()
+                await self.send(update, "❌ You can't remove the super admin.")
+                return
+            c.execute("SELECT user_id FROM chat_admins WHERE chat_id = ? AND LOWER(username) = LOWER(?)", (chat_id, arg))
+            row = c.fetchone()
+            if row and row[0] == SUPER_ADMIN_ID:
+                conn.close()
+                await self.send(update, "❌ You can't remove the super admin.")
+                return
+
         # Try both user_id and username
         try:
             user_id = int(arg)
@@ -1797,8 +1862,8 @@ class SoccerBotV2:
 
     async def listadmins_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """List all admins for the current chat"""
-        # Super-admin only.
-        if not self.is_super_admin(update.effective_user.id):
+        # Any admin can view the admin list.
+        if not self._role_for(update.effective_user) in ('super', 'admin'):
             await self.send(update, "❌ You are not authorized to use this command.")
             return
         
@@ -1823,13 +1888,13 @@ class SoccerBotV2:
         
         text = f"*🔐 Admins for chat {chat_id}:*\n"
         for user_id, username in admins:
-            safe_username = username.replace('_', '\\_')
+            label = (username or '').replace('_', '\\_') or '(no username)'
             if user_id and user_id != 0:
-                text += f"• {safe_username} (ID: {user_id})\n"
+                text += f"• {label} (ID: {user_id})\n"
             else:
-                text += f"• {safe_username}\n"
-        
-        await self.send(update, text)
+                text += f"• {label}\n"
+
+        await self.send(update, text, parse_mode='Markdown')
 
     async def listchats_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """List all groups the user is admin for"""
@@ -3538,6 +3603,9 @@ class SoccerBotV2:
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Warm welcome message with role-aware guidance."""
         user = update.effective_user
+        # Pressing Start always (re)pushes this user's slash-command menu — the
+        # reliable way a newly-added admin gets their commands to show up.
+        await self.sync_user_commands(user, force=True)
         if self.is_super_admin(user.id):
             role = 'super'
         elif self.is_admin_any_chat(user.id, user.username):
