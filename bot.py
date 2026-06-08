@@ -3157,7 +3157,7 @@ class SoccerBotV2:
         c = conn.cursor()
         for raw in context.args:
             is_display = not raw.startswith('@')
-            name = raw.lstrip('@').strip()
+            name = raw.lstrip('@').strip().strip('"').strip("'")
             if not name:
                 continue
             c.execute("SELECT 1 FROM members WHERE LOWER(username) = LOWER(?)", (name,))
