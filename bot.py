@@ -3148,16 +3148,19 @@ class SoccerBotV2:
         return row
 
     async def addmember_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Add players to the nudge roster. @username for pingable; plain name for no-username players."""
+        """Add players to the nudge roster. @username for pingable; plain name for no-username players.
+        Separate multiple entries with commas: /addmember Ali Tarkhani, @user2"""
         if not context.args:
-            await self.send(update, "Usage: /addmember @username or /addmember First\\ Last")
+            await self.send(update, "Usage: /addmember @username or /addmember Full Name\nMultiple: /addmember Ali Tarkhani, @user2, Soheil D")
             return
+        # Join all args then split on commas so multi-word names work
+        entries = [e.strip().strip('"').strip("'") for e in ' '.join(context.args).split(',')]
         added_ping, added_display, existing = [], [], []
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        for raw in context.args:
+        for raw in entries:
             is_display = not raw.startswith('@')
-            name = raw.lstrip('@').strip().strip('"').strip("'")
+            name = raw.lstrip('@').strip()
             if not name:
                 continue
             c.execute("SELECT 1 FROM members WHERE LOWER(username) = LOWER(?)", (name,))
@@ -3180,14 +3183,15 @@ class SoccerBotV2:
         await self.send(update, "\n".join(lines) or "Nothing to add.")
 
     async def removemember_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Remove players from the nudge roster: /removemember @username or /removemember Name"""
+        """Remove players from the nudge roster. Comma-separated for multiple: /removemember Ali Tarkhani, @user2"""
         if not context.args:
-            await self.send(update, "Usage: /removemember @username or /removemember Name")
+            await self.send(update, "Usage: /removemember @username or /removemember Full Name\nMultiple: /removemember Ali Tarkhani, @user2")
             return
+        entries = [e.strip().strip('"').strip("'") for e in ' '.join(context.args).split(',')]
         removed, missing = [], []
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        for raw in context.args:
+        for raw in entries:
             name = raw.lstrip('@').strip()
             if not name:
                 continue
