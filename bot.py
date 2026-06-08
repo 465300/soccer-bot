@@ -3244,10 +3244,14 @@ class SoccerBotV2:
         CHUNK = 30
         for i in range(0, len(usernames), CHUNK):
             batch = usernames[i:i + CHUNK]
-            mentions = ' '.join(
-                self._esc(name) if is_dn else f"@{self._esc(name)}"
-                for name, is_dn in batch
-            )
+            pinged = [f"@{self._esc(name)}" for name, is_dn in batch if not is_dn]
+            display = [self._esc(name) for name, is_dn in batch if is_dn]
+            parts = []
+            if pinged:
+                parts.append(' '.join(pinged))
+            if display:
+                parts.append(', '.join(display))
+            mentions = '\n\n'.join(parts)
             text = f"{header}\n\n{mentions}" if i == 0 else mentions
             try:
                 await self.application.bot.send_message(
