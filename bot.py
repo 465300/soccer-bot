@@ -2314,6 +2314,8 @@ class SoccerBotV2:
                     chat_id=SUPER_ADMIN_ID, text="\n".join(lines))
             except Exception as e:
                 logger.warning(f"Could not DM admin guest close summary: {e}")
+
+    async def switchgroup_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show all registered groups as inline buttons; tapping one sets the active group."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
