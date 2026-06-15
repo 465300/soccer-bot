@@ -4311,9 +4311,12 @@ class SoccerBotV2:
             SELECT cg.chat_id, cg.group_name, qp.id, qp.location_name, qp.game_date, qp.time_start
             FROM chat_groups cg
             JOIN quickpolls qp ON qp.chat_id = cg.chat_id
-                AND qp.id = (SELECT MAX(id) FROM quickpolls WHERE chat_id = cg.chat_id AND closed = 0)
+                AND qp.id = (SELECT MAX(id) FROM quickpolls
+                             WHERE chat_id = cg.chat_id AND closed = 0
+                               AND (game_date IS NULL OR game_date >= date('now', '-1 day')))
             LEFT JOIN chat_admins ca ON ca.chat_id = cg.chat_id AND ca.user_id = ?
             WHERE qp.closed = 0
+              AND (qp.game_date IS NULL OR qp.game_date >= date('now', '-1 day'))
               AND (ca.user_id IS NOT NULL OR ? = ?)
             ORDER BY cg.group_name
         """, (user_id, user_id, SUPER_ADMIN_ID))
