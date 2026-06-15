@@ -637,13 +637,21 @@ class SoccerBotV2:
             c.execute("ALTER TABLE members ADD COLUMN is_display_name INTEGER DEFAULT 0")
         except:
             pass
-        # Cleanup: close any quickpolls whose game date is in the past,
-        # or have no game_date but were created more than 1 day ago
-        c.execute("""UPDATE quickpolls SET closed = 1
-                     WHERE closed = 0 AND (
-                         (game_date IS NOT NULL AND game_date < date('now'))
-                         OR (game_date IS NULL AND created_at < datetime('now', '-1 day'))
-                     )""")
+        # Cleanup: close quickpolls with past or non-ISO game dates (legacy test polls)
+        today = datetime.now(TZ).date()
+        c.execute("SELECT id, game_date FROM quickpolls WHERE closed = 0")
+        for pid, gd in c.fetchall():
+            if not gd:
+                continue
+            try:
+                # Real active polls use ISO format (YYYY-MM-DD) from the wizard.
+                # Anything that fails to parse as ISO is old test data — close it.
+                game_d = datetime.strptime(gd.strip(), '%Y-%m-%d').date()
+                if game_d < today:
+                    c.execute("UPDATE quickpolls SET closed = 1 WHERE id = ?", (pid,))
+            except ValueError:
+                # Non-ISO date (e.g. 'May 30') — legacy/test poll, close it
+                c.execute("UPDATE quickpolls SET closed = 1 WHERE id = ?", (pid,))
         conn.commit()
         conn.close()
 
@@ -4319,19 +4327,26 @@ class SoccerBotV2:
             SELECT cg.chat_id, cg.group_name, qp.id, qp.location_name, qp.game_date, qp.time_start
             FROM chat_groups cg
             JOIN quickpolls qp ON qp.chat_id = cg.chat_id
-                AND qp.id = (SELECT MAX(id) FROM quickpolls
-                             WHERE chat_id = cg.chat_id AND closed = 0
-                               AND (game_date >= date('now', '-1 day')
-                                    OR (game_date IS NULL AND created_at >= datetime('now', '-1 day'))))
+                AND qp.id = (SELECT MAX(id) FROM quickpolls WHERE chat_id = cg.chat_id AND closed = 0)
             LEFT JOIN chat_admins ca ON ca.chat_id = cg.chat_id AND ca.user_id = ?
             WHERE qp.closed = 0
-              AND (qp.game_date >= date('now', '-1 day')
-                   OR (qp.game_date IS NULL AND qp.created_at >= datetime('now', '-1 day')))
               AND (ca.user_id IS NOT NULL OR ? = ?)
             ORDER BY cg.group_name
         """, (user_id, user_id, SUPER_ADMIN_ID))
         groups = c.fetchall()  # [(chat_id, group_name, poll_id, location, game_date, time_start), ...]
         conn.close()
+
+        # Filter in Python — SQL date comparison is unreliable when game_date
+        # may be stored in non-ISO formats like 'May 30'
+        _today = datetime.now(TZ).date()
+        def _is_upcoming(gd):
+            if not gd:
+                return True  # no date = include (let admin decide)
+            try:
+                return datetime.strptime(gd.strip(), '%Y-%m-%d').date() >= _today
+            except ValueError:
+                return False  # unparseable = legacy test poll, exclude
+        groups = [r for r in groups if _is_upcoming(r[4])]
 
         if not groups:
             await self.send(update, "❌ No open quickpolls found in any of your groups.")
