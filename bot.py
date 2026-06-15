@@ -4287,16 +4287,16 @@ class SoccerBotV2:
             return CANCEL_QP_REASON
         # Run from private DM — find all groups this admin manages that have an open poll
         c.execute("""
-            SELECT cg.chat_id, cg.group_name, MAX(qp.id) AS latest_poll_id
+            SELECT cg.chat_id, cg.group_name, qp.id, qp.location_name, qp.game_date, qp.time_start
             FROM chat_groups cg
             JOIN quickpolls qp ON qp.chat_id = cg.chat_id
+                AND qp.id = (SELECT MAX(id) FROM quickpolls WHERE chat_id = cg.chat_id AND closed = 0)
             LEFT JOIN chat_admins ca ON ca.chat_id = cg.chat_id AND ca.user_id = ?
             WHERE qp.closed = 0
               AND (ca.user_id IS NOT NULL OR ? = ?)
-            GROUP BY cg.chat_id
             ORDER BY cg.group_name
         """, (user_id, user_id, SUPER_ADMIN_ID))
-        groups = c.fetchall()  # [(chat_id, group_name, latest_poll_id), ...]
+        groups = c.fetchall()  # [(chat_id, group_name, poll_id, location, game_date, time_start), ...]
         conn.close()
 
         if not groups:
@@ -4304,14 +4304,22 @@ class SoccerBotV2:
             return ConversationHandler.END
 
         if len(groups) == 1:
-            context.user_data['cancel_qp_poll_id'] = groups[0][2]
-            context.user_data['cancel_qp_chat_id'] = groups[0][0]
-            await self.send(update, f"Cancelling poll in *{groups[0][1]}*.\n\nWhat's the reason? Send it or /skip.", parse_mode='Markdown')
+            chat_id, group_name, poll_id, location, game_date, time_start = groups[0]
+            context.user_data['cancel_qp_poll_id'] = poll_id
+            context.user_data['cancel_qp_chat_id'] = chat_id
+            date_str = self._pretty_date(game_date) if game_date else 'TBD'
+            time_str = f" · {time_start}" if time_start else ""
+            await self.send(update, f"Cancelling poll in *{group_name}*:\n📍 {location} — {date_str}{time_str}\n\nWhat's the reason? Send it or /skip.", parse_mode='Markdown')
             return CANCEL_QP_REASON
 
-        # Multiple groups — show inline group picker
-        buttons = [[InlineKeyboardButton(name, callback_data=f"cqpg:{chat_id}:{poll_id}")]
-                   for chat_id, name, poll_id in groups]
+        # Multiple groups — show inline group picker with poll details
+        lines = ["Which group's poll do you want to cancel?\n"]
+        buttons = []
+        for chat_id, group_name, poll_id, location, game_date, time_start in groups:
+            date_str = self._pretty_date(game_date) if game_date else 'TBD'
+            time_str = f" · {time_start}" if time_start else ""
+            label = f"{group_name}: {location} — {date_str}{time_str}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"cqpg:{chat_id}:{poll_id}")])
         await self.send(update, "Which group's poll do you want to cancel?",
                         reply_markup=InlineKeyboardMarkup(buttons))
         return CANCEL_QP_GROUP
@@ -4354,17 +4362,20 @@ class SoccerBotV2:
         c = conn.cursor()
         c.execute("SELECT group_name FROM chat_groups WHERE chat_id = ?", (chat_id,))
         row = c.fetchone()
+        c.execute("SELECT location_name, game_date, time_start FROM quickpolls WHERE id = ?", (poll_id,))
+        prow = c.fetchone()
         conn.close()
         group_name = row[0] if row else str(chat_id)
-        # Store in user_data so the ConversationHandler can pick it up next
-        # We can't return a state from a plain callback, so we just edit the
-        # message and ask for the reason — the ConversationHandler is still
-        # waiting in CANCEL_QP_GROUP state for a text reply, so we store the
-        # selection in a side-channel dict keyed by user_id.
+        if prow:
+            date_str = self._pretty_date(prow[1]) if prow[1] else 'TBD'
+            time_str = f" · {prow[2]}" if prow[2] else ""
+            poll_detail = f"\n📍 {prow[0]} — {date_str}{time_str}"
+        else:
+            poll_detail = ""
         self._cqpg_pending[query.from_user.id] = (poll_id, chat_id, group_name)
         await query.answer()
         await query.edit_message_text(
-            f"Cancelling poll in *{group_name}*.\n\nWhat's the reason? Reply here or /skip.",
+            f"Cancelling poll in *{group_name}*{poll_detail}\n\nWhat's the reason? Reply here or /skip.",
             parse_mode='Markdown')
 
     async def cancel_qp_reason(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4419,6 +4430,7 @@ class SoccerBotV2:
         # Clear votes so refund can't happen twice; clear guests (no charges yet at cancel)
         c.execute("DELETE FROM quickpoll_votes WHERE poll_id = ?", (poll_id,))
         c.execute("DELETE FROM quickpoll_guests WHERE poll_id = ?", (poll_id,))
+        c.execute("UPDATE quickpolls SET closed = 1 WHERE id = ?", (poll_id,))
         conn.commit()
         conn.close()
 
