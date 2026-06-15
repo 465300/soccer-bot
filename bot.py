@@ -238,6 +238,7 @@ class SoccerBotV2:
         admin_ops_cmds = [
             BotCommand('quickpoll', 'Set up a game poll for your group'),
             BotCommand('closepoll', 'Close voting and post the final player list'),
+            BotCommand('refreshpoll', 'Push latest buttons to an existing poll card'),
             BotCommand('addplayer', 'Force-add a player to the latest game — /addplayer @user [reason]'),
             BotCommand('removeplayer', 'Force-remove a player from the latest game — /removeplayer @user'),
             BotCommand('nudge', 'Ping members who haven\'t voted yet — /nudge [poll_id]'),
