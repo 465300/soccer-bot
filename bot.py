@@ -1576,7 +1576,7 @@ class SoccerBotV2:
         return InlineKeyboardMarkup([[
             InlineKeyboardButton("IN", callback_data=f"qvote_{poll_id}_in"),
             InlineKeyboardButton("OUT", callback_data=f"qvote_{poll_id}_out"),
-            InlineKeyboardButton("➕ Guest", callback_data=f"qguest_add_{poll_id}"),
+            InlineKeyboardButton("+1 Guest", callback_data=f"qguest_add_{poll_id}"),
             InlineKeyboardButton("🗑 My Guests", callback_data=f"qguest_remove_{poll_id}"),
         ]])
 
@@ -1660,8 +1660,8 @@ class SoccerBotV2:
         lines.append(f"✅ <b>IN — {in_count}{guest_note}</b>")
         for i, (name, uid) in enumerate(ins, 1):
             lines.append(f"{self._circled(i)}  {self._mention(name, uid)}")
-            for gname in inviter_guests.get((name or '').lower(), []):
-                lines.append(f"   ↳ {self._esc(gname)} (guest)")
+            for gi, gname in enumerate(inviter_guests.get((name or '').lower(), []), 1):
+                lines.append(f"   ↳ Guest {gi}: {self._esc(gname)}")
 
         lines.append("")
         lines.append(f"❌ <b>OUT — {out_count}</b>")
@@ -2091,10 +2091,9 @@ class SoccerBotV2:
         wallet = self.get_wallet(username)
         balance = wallet['balance'] if wallet else 0
         if balance - (VOTE_COST * (existing + 1)) < WALLET_FLOOR:
-            await self._safe_answer(
-                query,
-                f"💳 Your balance won't cover another guest — top up to add guests.",
-                show_alert=True)
+            msg = f"💳 Your balance won't cover another guest — top up to add guests."
+            await self._safe_answer(query, msg, show_alert=True)
+            await self.send_topup_prompt(user.id, msg)
             return
         # Store pending state and DM the user
         self._pending_guest_add[user.id] = {'poll_id': poll_id}
