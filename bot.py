@@ -1003,6 +1003,30 @@ class SoccerBotV2:
         await query.answer()
         user = query.from_user
         username = user.username or user.first_name
+        # Super-admin tops up themselves — auto-approve, no confirmation needed
+        if SUPER_ADMIN_ID and user.id == SUPER_ADMIN_ID:
+            now = datetime.now(TZ).isoformat()
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("""INSERT INTO payment_confirmations
+                         (user_id, username, amount, payment_date, confirmed_date, status, notes)
+                         VALUES (?, ?, ?, ?, ?, 'pending_topup', 'auto_approved_super_admin')""",
+                      (user.id, username, amount, now, now))
+            pc_id = c.lastrowid
+            conn.commit()
+            conn.close()
+            self.credit_wallet(username, amount, f"topup_approved:{pc_id}")
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("UPDATE payment_confirmations SET status = 'confirmed', confirmed_date = ? WHERE id = ?",
+                      (now, pc_id))
+            conn.commit()
+            conn.close()
+            bal = self.get_wallet(username)['balance']
+            await query.edit_message_text(
+                f"✅ *${amount:.2f} added to your wallet!*\nNew balance: *${bal:.2f}*",
+                parse_mode='Markdown')
+            return
         # Guard: already have a pending top-up request?
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
