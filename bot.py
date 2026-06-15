@@ -1600,7 +1600,7 @@ class SoccerBotV2:
         return InlineKeyboardMarkup([[
             InlineKeyboardButton("IN", callback_data=f"qvote_{poll_id}_in"),
             InlineKeyboardButton("OUT", callback_data=f"qvote_{poll_id}_out"),
-            InlineKeyboardButton("+1 Guest", callback_data=f"qguest_add_{poll_id}"),
+            InlineKeyboardButton("+1", callback_data=f"qguest_add_{poll_id}"),
             InlineKeyboardButton("🗑 My Guests", callback_data=f"qguest_remove_{poll_id}"),
         ]])
 
@@ -1693,12 +1693,9 @@ class SoccerBotV2:
             lines.append(f"{self._circled(i)}  {self._mention(name, uid)}")
 
         lines.append("")
-        if closed:
-            lines.append(f"${VOTE_COST:.0f}/game")
-        else:
-            lines.append(f"${VOTE_COST:.0f}/game · switch to OUT before deadline = full refund")
-            if total_guests:
-                lines.append("👥 Guests waitlisted — confirmed &amp; charged at close")
+        lines.append("1- Switch to out before deadline = full refund")
+        lines.append("2- Post deadline, exceptions may be made. Reach out to <b>ADMINS</b>")
+        lines.append("3- Guests waitlisted — confirmed &amp; charged at close if cap's got room")
 
         return "\n".join(lines)
 
@@ -2125,7 +2122,7 @@ class SoccerBotV2:
         try:
             await self.application.bot.send_message(
                 chat_id=user.id,
-                text="What's your guest's name? Reply here (or /cancel to abort).")
+                text="Enter guest name(s) — separate multiple with commas (e.g. Marco, Sarah, Alex).\nOr /cancel to abort.")
         except Exception as e:
             logger.warning(f"Could not DM guest-add prompt to {user.id}: {e}")
             self._pending_guest_add.pop(user.id, None)
@@ -2162,25 +2159,48 @@ class SoccerBotV2:
             self._pending_guest_remove.pop(user.id, None)
 
     async def _handle_guest_add_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Private DM reply after ➕ Guest — insert guest row and refresh card."""
+        """Private DM reply after +1 — parse comma-separated names, wallet-check for N, insert all."""
         user = update.effective_user
         pending = self._pending_guest_add.pop(user.id, None)
         if not pending:
             return
         poll_id = pending['poll_id']
-        guest_name = update.message.text.strip()
-        if not guest_name or len(guest_name) > 60:
-            await self.send(update, "❌ Guest name must be 1–60 characters. Try again: /cancel to abort.")
+        raw = update.message.text.strip()
+        names = [n.strip() for n in raw.split(',') if n.strip()]
+        if not names:
+            await self.send(update, "❌ No names found. Try again or /cancel to abort.")
+            self._pending_guest_add[user.id] = pending  # put back
+            return
+        bad = [n for n in names if len(n) > 60]
+        if bad:
+            await self.send(update, f"❌ Name too long (max 60 chars): {bad[0]}. Try again or /cancel to abort.")
             self._pending_guest_add[user.id] = pending  # put back
             return
         username = user.username or user.first_name
+        # Re-check wallet eligibility for this many new guests
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("""INSERT INTO quickpoll_guests (poll_id, member_user_id, member_username, guest_name)
-                     VALUES (?, ?, ?, ?)""", (poll_id, user.id, username, guest_name))
+        c.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND member_user_id = ?",
+                  (poll_id, user.id))
+        existing = c.fetchone()[0]
+        conn.close()
+        wallet = self.get_wallet(username)
+        balance = wallet['balance'] if wallet else 0
+        if balance - (VOTE_COST * (existing + len(names))) < WALLET_FLOOR:
+            await self.send(update, f"💳 Your balance won't cover {len(names)} guest(s) — top up and try again.")
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        for name in names:
+            c.execute("""INSERT INTO quickpoll_guests (poll_id, member_user_id, member_username, guest_name)
+                         VALUES (?, ?, ?, ?)""", (poll_id, user.id, username, name))
         conn.commit()
         conn.close()
-        await self.send(update, f"✅ \"{guest_name}\" added as your guest. They appear on the poll now.")
+        if len(names) == 1:
+            await self.send(update, f"✅ \"{names[0]}\" added as your guest.")
+        else:
+            listed = "\n".join(f"• {n}" for n in names)
+            await self.send(update, f"✅ {len(names)} guests added:\n{listed}")
         self.schedule_quickpoll_refresh(poll_id)
 
     async def _handle_guest_remove_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
