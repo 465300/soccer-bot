@@ -4319,9 +4319,30 @@ class SoccerBotV2:
         return CANCEL_QP_GROUP
 
     async def cancel_qp_group_pick(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Step 1b (text fallback): admin typed something instead of tapping a button."""
+        """Step 1b: in CANCEL_QP_GROUP state. If group was already picked via inline button,
+        treat this text as the cancellation reason and execute. Otherwise prompt to tap."""
+        user = update.effective_user
+        pending = self._cqpg_pending.pop(user.id, None)
+        if pending:
+            poll_id, chat_id, _ = pending
+            context.user_data['cancel_qp_poll_id'] = poll_id
+            context.user_data['cancel_qp_chat_id'] = chat_id
+            reason = update.message.text.strip()
+            await self._execute_cancel_quickpoll(update, context, reason)
+            return ConversationHandler.END
         await self.send(update, "Please tap one of the group buttons above, or /cancel to abort.")
         return CANCEL_QP_GROUP
+
+    async def cancel_qp_group_skip(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Step 1b /skip: group already picked via button — execute with no reason."""
+        user = update.effective_user
+        pending = self._cqpg_pending.pop(user.id, None)
+        if pending:
+            poll_id, chat_id, _ = pending
+            context.user_data['cancel_qp_poll_id'] = poll_id
+            context.user_data['cancel_qp_chat_id'] = chat_id
+        await self._execute_cancel_quickpoll(update, context, "No reason given.")
+        return ConversationHandler.END
 
     async def handle_cancelqp_group_callback(self, query, chat_id_str: str, poll_id_str: str):
         """Inline button tap on the group picker for /cancelquickpoll."""
@@ -4563,6 +4584,7 @@ class SoccerBotV2:
             entry_points=[CommandHandler('cancelquickpoll', self.cancelquickpoll_cmd, filters=filters.ChatType.PRIVATE)],
             states={
                 CANCEL_QP_GROUP: [
+                    CommandHandler('skip', self.cancel_qp_group_skip),
                     MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.cancel_qp_group_pick),
                 ],
                 CANCEL_QP_REASON: [
