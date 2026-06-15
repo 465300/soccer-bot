@@ -3510,7 +3510,7 @@ class SoccerBotV2:
         await query.edit_message_text(f"✅ Action '{action}' approved. Posting...")
 
         if action == 'roster':
-            await self.post_roster(poll_id, chat_id, force_send=True)
+            pass  # Roster posting removed — live card is the roster
 
         elif action == 'teams':
             # Post the prebuilt teams message stored in _pending_teams
@@ -3665,10 +3665,8 @@ class SoccerBotV2:
 
         # Confirm guests (charge inviters for spots, notify short wallets)
         await self.confirm_quickpoll_guests(poll_id, chat_id)
-
-        # Post the roster (goes to admin approval unless force_send=True)
-        await self.post_roster(poll_id, chat_id)
-        await self.send(update, "✅ Poll closed! Check your DMs to approve and post the roster.")
+        # Live card IS the roster — no separate roster post needed
+        await self.send(update, "✅ Poll closed.")
 
     # ── UX-2: admin override — add/remove any player after the deadline ────
     def resolve_user_id(self, username: str):
@@ -4216,7 +4214,7 @@ class SoccerBotV2:
                         if qp_row and qp_row[0]:
                             await self.close_quickpoll_buttons(qp_chat_id, qp_row[0])
                         await self.confirm_quickpoll_guests(qp_poll_id, qp_chat_id)
-                        await self.post_roster(qp_poll_id, qp_chat_id)
+                        # Live card IS the roster — no separate roster post needed
                     elif event_type == 'finalize_teams':
                         await self.finalize_teams(payload['poll_id'], payload['chat_id'], payload['admin_id'])
                     elif event_type == 'prompt_late_arrivals':
