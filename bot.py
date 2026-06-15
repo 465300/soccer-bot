@@ -62,6 +62,7 @@ CASHOUT_AMOUNT, CASHOUT_HANDLE = 121, 122
 
 # Cancel quickpoll with reason
 CANCEL_QP_REASON = 123
+CANCEL_QP_GROUP  = 124
 
 # ===== Payment / wallet config =====
 VENMO_HANDLE = '@chico-leo'  # Venmo handle players pay to for top-ups
@@ -106,6 +107,7 @@ class SoccerBotV2:
         self._refresh_tasks: dict[int, asyncio.Task] = {}  # poll_id -> pending debounced card-refresh task
         self._pending_guest_add: dict[int, dict] = {}  # user_id -> {poll_id}
         self._pending_guest_remove: dict[int, dict] = {}  # user_id -> {poll_id, guests: [(id, name), ...]}
+        self._cqpg_pending: dict[int, tuple] = {}  # user_id -> (poll_id, chat_id, group_name) from group picker
         self.init_database()
 
     async def send(self, update: Update, text: str, **kwargs):
@@ -1825,6 +1827,10 @@ class SoccerBotV2:
             return
         if query.data.startswith('sg:'):
             await self.handle_switchgroup_callback(query, query.data.split(':', 1)[1])
+            return
+        if query.data.startswith('cqpg:'):
+            parts = query.data.split(':')  # cqpg:{chat_id}:{poll_id}
+            await self.handle_cancelqp_group_callback(query, parts[1], parts[2])
             return
         # Top-up approval (super-admin taps Approve/Reject on pending top-up DM)
         if query.data.startswith('tapprove:'):
@@ -4262,7 +4268,7 @@ class SoccerBotV2:
     # ===== CANCELLATION COMMANDS =====
 
     async def cancelquickpoll_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Step 1: Ask admin for a cancellation reason before proceeding."""
+        """Step 1: If admin manages multiple groups with polls, show picker first."""
         if update.effective_chat.type in ['group', 'supergroup']:
             await self.delete_message_safely(update.effective_chat.id, update.message.message_id)
 
@@ -4270,35 +4276,97 @@ class SoccerBotV2:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         if update.effective_chat.type in ['group', 'supergroup']:
-            c.execute("SELECT id, chat_id FROM quickpolls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1", (update.effective_chat.id,))
-        else:
-            c.execute("""
-                SELECT qp.id, qp.chat_id FROM quickpolls qp
-                JOIN chat_admins ca ON qp.chat_id = ca.chat_id
-                WHERE ca.user_id = ?
-                ORDER BY qp.created_at DESC LIMIT 1
-            """, (user_id,))
-        poll = c.fetchone()
+            # Run from inside a group — target that group directly
+            c.execute("SELECT id, chat_id FROM quickpolls WHERE chat_id = ? AND closed = 0 ORDER BY created_at DESC LIMIT 1", (update.effective_chat.id,))
+            poll = c.fetchone()
+            conn.close()
+            if not poll:
+                await self.send(update, "❌ No open quickpoll found in this group.")
+                return ConversationHandler.END
+            context.user_data['cancel_qp_poll_id'] = poll[0]
+            context.user_data['cancel_qp_chat_id'] = poll[1]
+            await self.send(update, "What's the reason for cancelling?\n\nSend your reason or /skip to cancel without one.")
+            return CANCEL_QP_REASON
+        # Run from private DM — find all groups this admin manages that have an open poll
+        c.execute("""
+            SELECT cg.chat_id, cg.group_name, MAX(qp.id) AS latest_poll_id
+            FROM chat_groups cg
+            JOIN quickpolls qp ON qp.chat_id = cg.chat_id
+            LEFT JOIN chat_admins ca ON ca.chat_id = cg.chat_id AND ca.user_id = ?
+            WHERE qp.closed = 0
+              AND (ca.user_id IS NOT NULL OR ? = ?)
+            GROUP BY cg.chat_id
+            ORDER BY cg.group_name
+        """, (user_id, user_id, SUPER_ADMIN_ID))
+        groups = c.fetchall()  # [(chat_id, group_name, latest_poll_id), ...]
         conn.close()
 
-        if not poll:
-            await self.send(update, "❌ No quickpoll found to cancel.")
+        if not groups:
+            await self.send(update, "❌ No open quickpolls found in any of your groups.")
             return ConversationHandler.END
 
-        context.user_data['cancel_qp_poll_id'] = poll[0]
-        context.user_data['cancel_qp_chat_id'] = poll[1]
+        if len(groups) == 1:
+            context.user_data['cancel_qp_poll_id'] = groups[0][2]
+            context.user_data['cancel_qp_chat_id'] = groups[0][0]
+            await self.send(update, f"Cancelling poll in *{groups[0][1]}*.\n\nWhat's the reason? Send it or /skip.", parse_mode='Markdown')
+            return CANCEL_QP_REASON
 
-        await self.send(update, "What's the reason for cancelling?\n\nSend your reason or /skip to cancel without one.")
-        return CANCEL_QP_REASON
+        # Multiple groups — show inline group picker
+        buttons = [[InlineKeyboardButton(name, callback_data=f"cqpg:{chat_id}:{poll_id}")]
+                   for chat_id, name, poll_id in groups]
+        await self.send(update, "Which group's poll do you want to cancel?",
+                        reply_markup=InlineKeyboardMarkup(buttons))
+        return CANCEL_QP_GROUP
+
+    async def cancel_qp_group_pick(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Step 1b (text fallback): admin typed something instead of tapping a button."""
+        await self.send(update, "Please tap one of the group buttons above, or /cancel to abort.")
+        return CANCEL_QP_GROUP
+
+    async def handle_cancelqp_group_callback(self, query, chat_id_str: str, poll_id_str: str):
+        """Inline button tap on the group picker for /cancelquickpoll."""
+        try:
+            chat_id = int(chat_id_str)
+            poll_id = int(poll_id_str)
+        except ValueError:
+            await query.answer("Invalid selection.")
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT group_name FROM chat_groups WHERE chat_id = ?", (chat_id,))
+        row = c.fetchone()
+        conn.close()
+        group_name = row[0] if row else str(chat_id)
+        # Store in user_data so the ConversationHandler can pick it up next
+        # We can't return a state from a plain callback, so we just edit the
+        # message and ask for the reason — the ConversationHandler is still
+        # waiting in CANCEL_QP_GROUP state for a text reply, so we store the
+        # selection in a side-channel dict keyed by user_id.
+        self._cqpg_pending[query.from_user.id] = (poll_id, chat_id, group_name)
+        await query.answer()
+        await query.edit_message_text(
+            f"Cancelling poll in *{group_name}*.\n\nWhat's the reason? Reply here or /skip.",
+            parse_mode='Markdown')
 
     async def cancel_qp_reason(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Step 2a: Got a reason — execute cancellation."""
+        # If we got here from the group-picker callback, pull poll/chat from side-channel
+        pending = self._cqpg_pending.pop(update.effective_user.id, None)
+        if pending:
+            poll_id, chat_id, _ = pending
+            context.user_data['cancel_qp_poll_id'] = poll_id
+            context.user_data['cancel_qp_chat_id'] = chat_id
         reason = update.message.text.strip()
         await self._execute_cancel_quickpoll(update, context, reason)
         return ConversationHandler.END
 
     async def cancel_qp_skip(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Step 2b: Admin skipped the reason — cancel with no reason given."""
+        pending = self._cqpg_pending.pop(update.effective_user.id, None)
+        if pending:
+            poll_id, chat_id, _ = pending
+            context.user_data['cancel_qp_poll_id'] = poll_id
+            context.user_data['cancel_qp_chat_id'] = chat_id
         await self._execute_cancel_quickpoll(update, context, "No reason given.")
         return ConversationHandler.END
 
@@ -4494,6 +4562,9 @@ class SoccerBotV2:
         cancelquickpoll_handler = ConversationHandler(
             entry_points=[CommandHandler('cancelquickpoll', self.cancelquickpoll_cmd, filters=filters.ChatType.PRIVATE)],
             states={
+                CANCEL_QP_GROUP: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.cancel_qp_group_pick),
+                ],
                 CANCEL_QP_REASON: [
                     CommandHandler('skip', self.cancel_qp_skip),
                     MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.cancel_qp_reason),
