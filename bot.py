@@ -637,8 +637,13 @@ class SoccerBotV2:
             c.execute("ALTER TABLE members ADD COLUMN is_display_name INTEGER DEFAULT 0")
         except:
             pass
-        # Cleanup: close any quickpolls whose game date is in the past
-        c.execute("UPDATE quickpolls SET closed = 1 WHERE closed = 0 AND game_date IS NOT NULL AND game_date < date('now')")
+        # Cleanup: close any quickpolls whose game date is in the past,
+        # or have no game_date but were created more than 1 day ago
+        c.execute("""UPDATE quickpolls SET closed = 1
+                     WHERE closed = 0 AND (
+                         (game_date IS NOT NULL AND game_date < date('now'))
+                         OR (game_date IS NULL AND created_at < datetime('now', '-1 day'))
+                     )""")
         conn.commit()
         conn.close()
 
@@ -4316,10 +4321,12 @@ class SoccerBotV2:
             JOIN quickpolls qp ON qp.chat_id = cg.chat_id
                 AND qp.id = (SELECT MAX(id) FROM quickpolls
                              WHERE chat_id = cg.chat_id AND closed = 0
-                               AND (game_date IS NULL OR game_date >= date('now', '-1 day')))
+                               AND (game_date >= date('now', '-1 day')
+                                    OR (game_date IS NULL AND created_at >= datetime('now', '-1 day'))))
             LEFT JOIN chat_admins ca ON ca.chat_id = cg.chat_id AND ca.user_id = ?
             WHERE qp.closed = 0
-              AND (qp.game_date IS NULL OR qp.game_date >= date('now', '-1 day'))
+              AND (qp.game_date >= date('now', '-1 day')
+                   OR (qp.game_date IS NULL AND qp.created_at >= datetime('now', '-1 day')))
               AND (ca.user_id IS NOT NULL OR ? = ?)
             ORDER BY cg.group_name
         """, (user_id, user_id, SUPER_ADMIN_ID))
