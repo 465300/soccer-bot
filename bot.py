@@ -82,7 +82,7 @@ SUPER_ADMIN_ID = int(_raw_super_admin_id) if _raw_super_admin_id.isdigit() else 
 # Role-based command routing for private chats
 PLAYER_COMMANDS = {'wallet', 'topup', 'cashout', 'cancel'}
 ADMIN_COMMANDS = {
-    'quickpoll', 'cancelquickpoll', 'closepoll', 'maketeams',
+    'quickpoll', 'cancelquickpoll', 'closepoll', 'refreshpoll', 'maketeams',
     'setskill', 'skills', 'deleteskill',
     'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats',
     'sendvenmolink', 'waive', 'initchats',
@@ -3668,6 +3668,27 @@ class SoccerBotV2:
         # Live card IS the roster — no separate roster post needed
         await self.send(update, "✅ Poll closed.")
 
+    async def refreshpoll_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Push the current keyboard (incl. +1 / My Guests) to the latest live
+        quickpoll message: /refreshpoll"""
+        user_id = update.effective_user.id
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            SELECT qp.id FROM quickpolls qp
+            JOIN chat_admins ca ON qp.chat_id = ca.chat_id
+            WHERE ca.user_id = ? AND qp.closed = 0
+            ORDER BY qp.created_at DESC LIMIT 1
+        """, (user_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            await self.send(update, "❌ No open quickpoll found.")
+            return
+        poll_id = row[0]
+        await self.refresh_quickpoll_message(poll_id)
+        await self.send(update, "✅ Poll card refreshed.")
+
     # ── UX-2: admin override — add/remove any player after the deadline ────
     def resolve_user_id(self, username: str):
         """Best-effort username→user_id (for a clickable mention). Looks at
@@ -4648,6 +4669,7 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('clearlate', self.clearlate_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('maketeams', self.maketeams_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('closepoll', self.closepoll_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('refreshpoll', self.refreshpoll_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('addplayer', self.addplayer_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('removeplayer', self.removeplayer_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('nudge', self.nudge_cmd, filters=filters.ChatType.PRIVATE))
