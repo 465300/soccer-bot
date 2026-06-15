@@ -4471,6 +4471,18 @@ class SoccerBotV2:
         c.execute("SELECT username FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
         in_voters = [r[0] for r in c.fetchall()]
 
+        # Snapshot OUT voters to payment_confirmations (amount=0) so they can
+        # be recovered after an accidental cancel — OUT voters are never charged
+        # so without this record they are permanently lost.
+        c.execute("SELECT username FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'out'", (poll_id,))
+        out_voters = [r[0] for r in c.fetchall()]
+        now_iso = datetime.now(TZ).isoformat()
+        for ou in out_voters:
+            c.execute("""INSERT INTO payment_confirmations
+                         (username, amount, payment_date, confirmed_date, status, notes)
+                         VALUES (?, 0, ?, ?, 'confirmed', ?)""",
+                      (ou, now_iso, now_iso, f'quickpoll_cancelled_out:{poll_id}'))
+
         # Grab message ID to close buttons
         c.execute("SELECT poll_message_id FROM quickpolls WHERE id = ?", (poll_id,))
         res = c.fetchone()
