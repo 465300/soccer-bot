@@ -7,6 +7,7 @@ import html
 import json
 import asyncio
 import logging
+import traceback
 from datetime import datetime, timedelta
 from telegram import (
     Update,
@@ -106,15 +107,65 @@ class SoccerBotV2:
         self.init_database()
 
     async def send(self, update: Update, text: str, **kwargs):
-        """Send message WITHOUT replying - uses direct API call and forwards kwargs"""
+        """Send message WITHOUT replying - uses direct API call and forwards kwargs.
+        If a parse_mode (Markdown/HTML) send fails because the text has a broken
+        entity, retry once as plain text so the user still gets the message
+        instead of the command silently doing nothing."""
         try:
             await self.application.bot.send_message(
-                chat_id=update.effective_chat.id, 
+                chat_id=update.effective_chat.id,
                 text=text,
                 **kwargs
             )
         except Exception as e:
+            if 'parse_mode' in kwargs and "parse entities" in str(e).lower():
+                logger.warning(f"Markdown/HTML send failed ({e}); retrying as plain text.")
+                fallback = {k: v for k, v in kwargs.items() if k != 'parse_mode'}
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=text,
+                        **fallback
+                    )
+                    return
+                except Exception as e2:
+                    logger.error(f"Plain-text retry also failed: {e2}")
             logger.error(f"Error sending message: {e}")
+
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Catch-all for unhandled exceptions in any handler. Without this,
+        python-telegram-bot logs nothing visible and the user just sees the
+        command do nothing (silent failure). Logs the full traceback and DMs
+        the super admin so problems surface immediately."""
+        logger.error("Unhandled exception while processing an update:", exc_info=context.error)
+        tb = "".join(traceback.format_exception(
+            type(context.error), context.error, getattr(context.error, '__traceback__', None)))
+
+        # Best-effort: who triggered it and with what input
+        where = ""
+        try:
+            if isinstance(update, Update) and update.effective_user:
+                u = update.effective_user
+                if update.message and update.message.text:
+                    trigger = update.message.text
+                elif update.callback_query:
+                    trigger = f"[callback] {update.callback_query.data}"
+                else:
+                    trigger = "(no text)"
+                where = f"user @{u.username or u.id} (id={u.id})\ninput: {trigger}\n\n"
+        except Exception:
+            pass
+
+        if SUPER_ADMIN_ID:
+            try:
+                head = f"⚠️ Bot error\n{where}{type(context.error).__name__}: {context.error}"
+                detail = html.escape(tb[-2500:])  # tail of traceback, within Telegram's 4096 cap
+                await self.application.bot.send_message(
+                    chat_id=SUPER_ADMIN_ID,
+                    text=f"{head}\n\n<pre>{detail}</pre>",
+                    parse_mode='HTML')
+            except Exception as e:
+                logger.error(f"Failed to DM super admin about error: {e}")
 
     def is_super_admin(self, user_id: int) -> bool:
         return bool(SUPER_ADMIN_ID and user_id == SUPER_ADMIN_ID)
@@ -259,7 +310,7 @@ class SoccerBotV2:
                 gnames = [r[0] for r in c.fetchall()]
                 conn.close()
                 if gnames:
-                    group_list = ", ".join(gnames)
+                    group_list = ", ".join(self.escape_markdown(g) for g in gnames)
                     await self.application.bot.send_message(
                         chat_id=user.id,
                         text=f"👋 You have admin access to: *{group_list}*\n\nUse /switchgroup to choose which group your commands target.",
@@ -2472,7 +2523,7 @@ class SoccerBotV2:
         context.user_data['qp']['available_groups'] = groups
 
         # Ask user to pick a group
-        group_list = "\n".join([f"{i+1}. {name}" for i, (_, name) in enumerate(groups)])
+        group_list = "\n".join([f"{i+1}. {self.escape_markdown(name)}" for i, (_, name) in enumerate(groups)])
         await self.send(update, f"⚡ *Quick Poll Setup*\n\nStep 1/10: Which group?\n\n{group_list}\n\nReply with the *number*:", parse_mode='Markdown')
         return QP_GROUP_SELECT
 
@@ -2528,8 +2579,8 @@ class SoccerBotV2:
                 [InlineKeyboardButton("🆕 Fresh start", callback_data="qp_fresh")],
             ]
             summary = (
-                f"📌 *Last poll for {selected_name}:*\n"
-                f"📍 {prev[0]}\n"
+                f"📌 *Last poll for {self.escape_markdown(selected_name)}:*\n"
+                f"📍 {self.escape_markdown(str(prev[0]))}\n"
                 f"🗓 {prev[2]} | {prev[3]}–{prev[4]}\n"
                 f"👥 Max: {prev[5]}\n\n"
                 f"What do you want to do?"
@@ -3865,6 +3916,9 @@ class SoccerBotV2:
     def run(self):
         persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
         self.application = Application.builder().token(self.token).persistence(persistence).post_init(self.on_startup).post_stop(self.on_shutdown).build()
+
+        # Surface unhandled exceptions instead of failing silently.
+        self.application.add_error_handler(self.error_handler)
 
         # Group command deletion handler (must be first to delete commands before processing)
         self.application.add_handler(MessageHandler(
