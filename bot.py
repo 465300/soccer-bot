@@ -637,6 +637,8 @@ class SoccerBotV2:
             c.execute("ALTER TABLE members ADD COLUMN is_display_name INTEGER DEFAULT 0")
         except:
             pass
+        # Cleanup: close any quickpolls whose game date is in the past
+        c.execute("UPDATE quickpolls SET closed = 1 WHERE closed = 0 AND game_date IS NOT NULL AND game_date < date('now')")
         conn.commit()
         conn.close()
 
