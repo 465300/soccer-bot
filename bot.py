@@ -104,6 +104,8 @@ class SoccerBotV2:
         self._pending_cancels: dict[str, str] = {}  # key -> cancel group message text
         self._pending_late_arrivals: dict[int, dict] = {}  # admin_id -> {poll_id, chat_id, players_list}
         self._refresh_tasks: dict[int, asyncio.Task] = {}  # poll_id -> pending debounced card-refresh task
+        self._pending_guest_add: dict[int, dict] = {}  # user_id -> {poll_id}
+        self._pending_guest_remove: dict[int, dict] = {}  # user_id -> {poll_id, guests: [(id, name), ...]}
         self.init_database()
 
     async def send(self, update: Update, text: str, **kwargs):
@@ -617,6 +619,16 @@ class SoccerBotV2:
         c.execute('''CREATE TABLE IF NOT EXISTS admin_active_chat (
             user_id INTEGER PRIMARY KEY,
             chat_id INTEGER)''')
+        # UX-4: guest (+1) system — inviter brings named guest(s) to a quickpoll
+        # confirmed: 0=waitlisted, 1=confirmed+charged, 2=pending_payment (inviter short)
+        c.execute('''CREATE TABLE IF NOT EXISTS quickpoll_guests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            poll_id INTEGER NOT NULL,
+            member_user_id INTEGER,
+            member_username TEXT COLLATE NOCASE,
+            guest_name TEXT NOT NULL,
+            confirmed INTEGER DEFAULT 0,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
         # Display-name-only members (no Telegram username, can't be @-pinged)
         try:
             c.execute("ALTER TABLE members ADD COLUMN is_display_name INTEGER DEFAULT 0")
@@ -987,27 +999,128 @@ class SoccerBotV2:
         await query.edit_message_text(text, reply_markup=keyboard, parse_mode='Markdown')
 
     async def confirm_topup(self, query, amount: float):
-        """Player tapped 'I've Paid' — credit the wallet (trust-based) and confirm."""
+        """Player tapped 'I've Paid' — submit for super-admin approval (trust-based)."""
         await query.answer()
         user = query.from_user
         username = user.username or user.first_name
-        self.credit_wallet(username, amount, "topup")
-        wallet = self.get_wallet(username)
-        balance = wallet['balance'] if wallet else amount
-        # Notify the super admin only (not every group admin)
+        # Guard: already have a pending top-up request?
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id FROM payment_confirmations WHERE LOWER(username) = LOWER(?) AND status = 'pending_topup'",
+                  (username,))
+        existing = c.fetchone()
+        conn.close()
+        if existing:
+            await query.edit_message_text(
+                "⏳ You already have a top-up pending — waiting for admin confirmation. "
+                "You'll be notified once it's approved.",
+                parse_mode='Markdown')
+            return
+        # Insert pending record (not credited yet)
+        now = datetime.now(TZ).isoformat()
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""INSERT INTO payment_confirmations
+                     (user_id, username, amount, payment_date, confirmed_date, status, notes)
+                     VALUES (?, ?, ?, ?, ?, 'pending_topup', 'awaiting_admin_approval')""",
+                  (user.id, username, amount, now, now))
+        pc_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        # DM super-admin
         if SUPER_ADMIN_ID:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"tapprove:{pc_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"treject:{pc_id}"),
+            ]])
             try:
                 await self.application.bot.send_message(
                     chat_id=SUPER_ADMIN_ID,
-                    text=f"💰 @{username} topped up *${amount:.2f}* — balance now *${balance:.2f}*.",
+                    text=f"💰 @{username} wants to top up *${amount:.2f}*.\nApprove to credit their wallet.",
+                    reply_markup=kb,
                     parse_mode='Markdown')
             except Exception as e:
-                logger.warning(f"Could not notify super admin of topup by {username}: {e}")
+                logger.warning(f"Could not DM super admin for topup approval: {e}")
         await query.edit_message_text(
-            f"✅ *${amount:.2f} added* — your balance is now *${balance:.2f}*.\n\n"
-            "You're set for the next few games. Will nudge you when it's time "
-            "to top up again.",
+            f"⏳ *${amount:.2f} top-up submitted* — waiting for admin confirmation.\n\n"
+            "You'll be notified as soon as it's approved.",
             parse_mode='Markdown')
+
+    async def topup_approve(self, query, pc_id: int):
+        """Super-admin approved a pending top-up — credit the wallet."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT user_id, username, amount, status FROM payment_confirmations WHERE id = ?", (pc_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            await self._safe_answer(query, "Top-up record not found.", show_alert=True)
+            return
+        user_id, username, amount, status = row
+        if status != 'pending_topup':
+            await self._safe_answer(query, f"Already processed ({status}).", show_alert=True)
+            return
+        self.credit_wallet(username, amount, f"topup_approved:{pc_id}")
+        # Update the pending record's status (credit_wallet creates a new 'confirmed' row;
+        # mark the pending row so it doesn't get double-approved)
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("UPDATE payment_confirmations SET status = 'approved' WHERE id = ?", (pc_id,))
+        conn.commit()
+        conn.close()
+        wallet = self.get_wallet(username)
+        balance = wallet['balance'] if wallet else amount
+        # DM the player
+        if user_id:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=user_id,
+                    text=f"✅ *${amount:.2f} added* — your balance is now *${balance:.2f}*.\n\n"
+                         "You're set for the next few games.",
+                    parse_mode='Markdown')
+            except Exception as e:
+                logger.warning(f"Could not DM topup approval to {user_id}: {e}")
+        await self._safe_answer(query, f"✅ Approved — @{username} credited ${amount:.2f}.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    async def topup_reject(self, query, pc_id: int):
+        """Super-admin rejected a pending top-up — notify the player."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT user_id, username, amount, status FROM payment_confirmations WHERE id = ?", (pc_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            await self._safe_answer(query, "Top-up record not found.", show_alert=True)
+            return
+        user_id, username, amount, status = row
+        if status != 'pending_topup':
+            await self._safe_answer(query, f"Already processed ({status}).", show_alert=True)
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("UPDATE payment_confirmations SET status = 'rejected' WHERE id = ?", (pc_id,))
+        conn.commit()
+        conn.close()
+        # DM the player
+        if user_id:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=user_id,
+                    text=f"❌ Your *${amount:.2f}* top-up was not confirmed by the admin.\n\n"
+                         "If you believe this is an error, reach out. "
+                         "You can resubmit anytime via /topup.",
+                    parse_mode='Markdown')
+            except Exception as e:
+                logger.warning(f"Could not DM topup rejection to {user_id}: {e}")
+        await self._safe_answer(query, f"❌ Rejected — @{username} notified.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
     async def topup_custom_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Entry point for the Custom top-up amount conversation."""
@@ -1459,11 +1572,12 @@ class SoccerBotV2:
         return disp
 
     def quickpoll_keyboard(self, poll_id: int) -> InlineKeyboardMarkup:
-        """IN/OUT buttons for a quickpoll (the STATUS button is gone — the
-        message itself is now the live status)."""
+        """IN/OUT + Guest management buttons for a quickpoll."""
         return InlineKeyboardMarkup([[
             InlineKeyboardButton("IN", callback_data=f"qvote_{poll_id}_in"),
             InlineKeyboardButton("OUT", callback_data=f"qvote_{poll_id}_out"),
+            InlineKeyboardButton("➕ Guest", callback_data=f"qguest_add_{poll_id}"),
+            InlineKeyboardButton("🗑 My Guests", callback_data=f"qguest_remove_{poll_id}"),
         ]])
 
     def render_quickpoll_message(self, poll_id: int, closed: bool = None) -> str:
@@ -1483,7 +1597,16 @@ class SoccerBotV2:
         c.execute("""SELECT username, vote_type, user_id FROM quickpoll_votes
                      WHERE poll_id = ? ORDER BY voted_at ASC, id ASC""", (poll_id,))
         rows = c.fetchall()
+        c.execute("""SELECT member_username, guest_name FROM quickpoll_guests
+                     WHERE poll_id = ? ORDER BY added_at ASC""", (poll_id,))
+        guest_rows = c.fetchall()
         conn.close()
+
+        # Build inviter → [guest_name, ...] map (order-preserving)
+        inviter_guests: dict = {}
+        for mu, gname in guest_rows:
+            inviter_guests.setdefault(mu.lower() if mu else '', []).append(gname)
+        total_guests = len(guest_rows)
 
         # Closed = explicit flag OR deadline already passed (so the card flips
         # to the closed banner even before the scheduled close event fires)
@@ -1533,9 +1656,12 @@ class SoccerBotV2:
             lines.append(f"{bar}   {in_count}/{max_players} max")
 
         lines.append("")
-        lines.append(f"✅ <b>IN — {in_count}</b>")
+        guest_note = f" · {total_guests} guest{'s' if total_guests != 1 else ''}" if total_guests else ""
+        lines.append(f"✅ <b>IN — {in_count}{guest_note}</b>")
         for i, (name, uid) in enumerate(ins, 1):
             lines.append(f"{self._circled(i)}  {self._mention(name, uid)}")
+            for gname in inviter_guests.get((name or '').lower(), []):
+                lines.append(f"   ↳ {self._esc(gname)} (guest)")
 
         lines.append("")
         lines.append(f"❌ <b>OUT — {out_count}</b>")
@@ -1547,6 +1673,8 @@ class SoccerBotV2:
             lines.append(f"${VOTE_COST:.0f}/game")
         else:
             lines.append(f"${VOTE_COST:.0f}/game · switch to OUT before deadline = full refund")
+            if total_guests:
+                lines.append("👥 Guests waitlisted — confirmed &amp; charged at close")
 
         return "\n".join(lines)
 
@@ -1677,6 +1805,22 @@ class SoccerBotV2:
         if query.data.startswith('sg:'):
             await self.handle_switchgroup_callback(query, query.data.split(':', 1)[1])
             return
+        # Top-up approval (super-admin taps Approve/Reject on pending top-up DM)
+        if query.data.startswith('tapprove:'):
+            await self.topup_approve(query, int(query.data.split(':', 1)[1]))
+            return
+        if query.data.startswith('treject:'):
+            await self.topup_reject(query, int(query.data.split(':', 1)[1]))
+            return
+        # Admin guest-remove prompt after /removeplayer
+        if query.data.startswith('qgrm:'):
+            parts = query.data.split(':')  # qgrm:all:{poll_id}:{username} or qgrm:keep:...
+            action, poll_id_s, username = parts[1], parts[2], parts[3]
+            if action == 'all':
+                await self.admin_remove_guests(query, int(poll_id_s), username)
+            else:
+                await self._safe_answer(query, "Guests kept on the waitlist.")
+            return
 
         data = query.data.split('_')
 
@@ -1685,6 +1829,17 @@ class SoccerBotV2:
             poll_id = int(data[1])
             vote_type = data[2]
             await self.process_quickpoll_vote(query, poll_id, vote_type)
+        elif data[0] == 'qguest':
+            poll_id = int(data[2])
+            action = data[1]
+            if action == 'add':
+                await self.guest_add_trigger(query, poll_id)
+            elif action == 'remove':
+                await self.guest_remove_trigger(query, poll_id)
+            elif action == 'clearout':
+                await self.guest_clear_on_out(query, poll_id)
+            elif action == 'keepout':
+                await self._safe_answer(query, "Your guests stay on the waitlist.")
         elif data[0] == 'qstatus':
             # Quick poll status
             poll_id = int(data[1])
@@ -1858,6 +2013,30 @@ class SoccerBotV2:
                 except Exception as e:
                     logger.warning(f"Could not send low-balance nudge to {user.id}: {e}")
 
+        # UX-4: when switching OUT, prompt about existing guests (fire-and-forget DM)
+        if old_vote == 'in' and vote_type == 'out':
+            gconn = sqlite3.connect(DB_FILE)
+            gc = gconn.cursor()
+            gc.execute("SELECT id, guest_name FROM quickpoll_guests WHERE poll_id = ? AND member_user_id = ?",
+                       (poll_id, user.id))
+            guests = gc.fetchall()
+            gconn.close()
+            if guests:
+                n = len(guests)
+                names = ', '.join(g[1] for g in guests)
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Yes, remove all", callback_data=f"qguest_clearout_{poll_id}"),
+                    InlineKeyboardButton("Keep on waitlist", callback_data=f"qguest_keepout_{poll_id}"),
+                ]])
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=user.id,
+                        text=(f"You voted OUT. You have {n} guest{'s' if n > 1 else ''} on this poll: {names}.\n\n"
+                              "Remove them too?"),
+                        reply_markup=kb)
+                except Exception as e:
+                    logger.warning(f"Could not DM guest-remove prompt to {user.id}: {e}")
+
         # UX-2: redraw the pinned roster card with the new vote.
         # Debounced + non-blocking so rapid IN/OUT toggling doesn't stall the
         # (sequential) update queue or trip Telegram's edit flood control.
@@ -1888,7 +2067,253 @@ class SoccerBotV2:
 
         await query.answer(f"📊 Your vote: {my_vote_str}\n\nIN: {in_count} | OUT: {out_count} | Total: {in_count}/{max_players}", show_alert=True)
 
-    async def switchgroup_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ── UX-4: Guest system ─────────────────────────────────────────────────
+
+    async def guest_add_trigger(self, query, poll_id: int):
+        """➕ Guest button tapped — gate check, wallet eligibility, then DM the user."""
+        user = query.from_user
+        username = user.username or user.first_name
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        # Gate: must be IN on this poll
+        c.execute("SELECT vote_type FROM quickpoll_votes WHERE poll_id = ? AND user_id = ?",
+                  (poll_id, user.id))
+        row = c.fetchone()
+        if not row or row[0] != 'in':
+            conn.close()
+            await self._safe_answer(query, "You need to vote IN before adding a guest.", show_alert=True)
+            return
+        # Wallet eligibility: balance - ($10 × (existing_guests + 1)) >= WALLET_FLOOR
+        c.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND member_user_id = ?",
+                  (poll_id, user.id))
+        existing = c.fetchone()[0]
+        conn.close()
+        wallet = self.get_wallet(username)
+        balance = wallet['balance'] if wallet else 0
+        if balance - (VOTE_COST * (existing + 1)) < WALLET_FLOOR:
+            await self._safe_answer(
+                query,
+                f"💳 Your balance won't cover another guest — top up to add guests.",
+                show_alert=True)
+            return
+        # Store pending state and DM the user
+        self._pending_guest_add[user.id] = {'poll_id': poll_id}
+        await self._safe_answer(query)
+        try:
+            await self.application.bot.send_message(
+                chat_id=user.id,
+                text="What's your guest's name? Reply here (or /cancel to abort).")
+        except Exception as e:
+            logger.warning(f"Could not DM guest-add prompt to {user.id}: {e}")
+            self._pending_guest_add.pop(user.id, None)
+
+    async def guest_remove_trigger(self, query, poll_id: int):
+        """🗑 My Guests button tapped — list guests and ask which to remove."""
+        user = query.from_user
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT vote_type FROM quickpoll_votes WHERE poll_id = ? AND user_id = ?",
+                  (poll_id, user.id))
+        vote_row = c.fetchone()
+        if not vote_row or vote_row[0] != 'in':
+            conn.close()
+            await self._safe_answer(query, "You need to be IN to manage your guests.", show_alert=True)
+            return
+        c.execute("SELECT id, guest_name FROM quickpoll_guests WHERE poll_id = ? AND member_user_id = ? ORDER BY added_at ASC",
+                  (poll_id, user.id))
+        guests = c.fetchall()
+        conn.close()
+        if not guests:
+            await self._safe_answer(query, "You have no guests on this poll.", show_alert=True)
+            return
+        self._pending_guest_remove[user.id] = {'poll_id': poll_id, 'guests': list(guests)}
+        await self._safe_answer(query)
+        lines = ["Your guests on this poll:"]
+        for i, (gid, gname) in enumerate(guests, 1):
+            lines.append(f"{i}. {gname}")
+        lines.append("\nReply with the number to remove (or /cancel to abort).")
+        try:
+            await self.application.bot.send_message(chat_id=user.id, text="\n".join(lines))
+        except Exception as e:
+            logger.warning(f"Could not DM guest-remove list to {user.id}: {e}")
+            self._pending_guest_remove.pop(user.id, None)
+
+    async def _handle_guest_add_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Private DM reply after ➕ Guest — insert guest row and refresh card."""
+        user = update.effective_user
+        pending = self._pending_guest_add.pop(user.id, None)
+        if not pending:
+            return
+        poll_id = pending['poll_id']
+        guest_name = update.message.text.strip()
+        if not guest_name or len(guest_name) > 60:
+            await self.send(update, "❌ Guest name must be 1–60 characters. Try again: /cancel to abort.")
+            self._pending_guest_add[user.id] = pending  # put back
+            return
+        username = user.username or user.first_name
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""INSERT INTO quickpoll_guests (poll_id, member_user_id, member_username, guest_name)
+                     VALUES (?, ?, ?, ?)""", (poll_id, user.id, username, guest_name))
+        conn.commit()
+        conn.close()
+        await self.send(update, f"✅ \"{guest_name}\" added as your guest. They appear on the poll now.")
+        self.schedule_quickpoll_refresh(poll_id)
+
+    async def _handle_guest_remove_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Private DM reply after 🗑 My Guests — delete the chosen guest row."""
+        user = update.effective_user
+        pending = self._pending_guest_remove.pop(user.id, None)
+        if not pending:
+            return
+        poll_id = pending['poll_id']
+        guests = pending['guests']  # [(id, name), ...]
+        try:
+            idx = int(update.message.text.strip()) - 1
+            if not (0 <= idx < len(guests)):
+                raise ValueError
+        except ValueError:
+            await self.send(update, f"❌ Reply with a number between 1 and {len(guests)}, or /cancel.")
+            self._pending_guest_remove[user.id] = pending  # put back
+            return
+        gid, gname = guests[idx]
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM quickpoll_guests WHERE id = ?", (gid,))
+        conn.commit()
+        conn.close()
+        await self.send(update, f"✅ \"{gname}\" removed from your guests.")
+        self.schedule_quickpoll_refresh(poll_id)
+
+    async def guest_clear_on_out(self, query, poll_id: int):
+        """User voted OUT and confirmed removing all their guests."""
+        user = query.from_user
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM quickpoll_guests WHERE poll_id = ? AND member_user_id = ?",
+                  (poll_id, user.id))
+        conn.commit()
+        conn.close()
+        await self._safe_answer(query, "✅ Your guests have been removed.")
+        self.schedule_quickpoll_refresh(poll_id)
+
+    async def admin_remove_guests(self, query, poll_id: int, username: str):
+        """Admin confirmed removing all guests belonging to a removed player."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM quickpoll_guests WHERE poll_id = ? AND LOWER(member_username) = LOWER(?)",
+                  (poll_id, username))
+        deleted = c.rowcount
+        conn.commit()
+        conn.close()
+        await self._safe_answer(query)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await self.application.bot.send_message(
+            chat_id=query.from_user.id,
+            text=f"✅ {deleted} guest(s) for @{username} removed.")
+        self.schedule_quickpoll_refresh(poll_id)
+
+    async def confirm_quickpoll_guests(self, poll_id: int, chat_id: int):
+        """At close: walk the guest waitlist, fill remaining spots, charge inviters."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT max_players FROM quickpolls WHERE id = ?", (poll_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return
+        max_players = row[0] or 0
+        c.execute("SELECT COUNT(*) FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
+        in_count = c.fetchone()[0]
+        remaining = max(0, max_players - in_count) if max_players else 0
+        # All waitlisted guests, ordered by time added
+        c.execute("""SELECT id, member_username, member_user_id, guest_name
+                     FROM quickpoll_guests WHERE poll_id = ? AND confirmed = 0
+                     ORDER BY added_at ASC""", (poll_id,))
+        guests = c.fetchall()
+        conn.close()
+        if not guests:
+            return
+        confirmed_guests = []
+        pending_payment: list[tuple] = []  # (username, user_id, guest_name, shortfall)
+        spots_used = 0
+        for gid, member_username, member_user_id, guest_name in guests:
+            # Inviter must still be IN at close
+            vc = sqlite3.connect(DB_FILE)
+            vcc = vc.cursor()
+            vcc.execute("SELECT vote_type FROM quickpoll_votes WHERE poll_id = ? AND LOWER(username) = LOWER(?)",
+                        (poll_id, member_username))
+            vote_row = vcc.fetchone()
+            vc.close()
+            if not vote_row or vote_row[0] != 'in':
+                # Inviter not IN — drop silently
+                dc = sqlite3.connect(DB_FILE)
+                dcc = dc.cursor()
+                dcc.execute("DELETE FROM quickpoll_guests WHERE id = ?", (gid,))
+                dc.commit()
+                dc.close()
+                continue
+            if spots_used >= remaining:
+                continue  # No spot — leave as waitlisted (not dropped)
+            # Check wallet
+            wallet = self.get_wallet(member_username)
+            balance = wallet['balance'] if wallet else 0
+            if balance - VOTE_COST >= WALLET_FLOOR:
+                self.deduct_wallet(member_username, VOTE_COST, f"quickpoll_guest:{poll_id}")
+                uc = sqlite3.connect(DB_FILE)
+                ucc = uc.cursor()
+                ucc.execute("UPDATE quickpoll_guests SET confirmed = 1 WHERE id = ?", (gid,))
+                uc.commit()
+                uc.close()
+                confirmed_guests.append((member_username, guest_name))
+                spots_used += 1
+            else:
+                shortfall = round(VOTE_COST - (balance - WALLET_FLOOR), 2)
+                uc = sqlite3.connect(DB_FILE)
+                ucc = uc.cursor()
+                ucc.execute("UPDATE quickpoll_guests SET confirmed = 2 WHERE id = ?", (gid,))
+                uc.commit()
+                uc.close()
+                pending_payment.append((member_username, member_user_id, guest_name, shortfall))
+                spots_used += 1  # Hold the spot; pending top-up secures it
+        # DM inviters who are short (one DM per inviter covering all their guests)
+        inviters_notified: set = set()
+        for mu, muid, gname, shortfall in pending_payment:
+            if mu in inviters_notified:
+                continue
+            inviters_notified.add(mu)
+            their = [(u, uid, g, s) for u, uid, g, s in pending_payment if u == mu]
+            n = len(their)
+            total_short = sum(s for *_, s in their)
+            if muid:
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=muid,
+                        text=(f"⚠️ Your {n} guest{'s' if n > 1 else ''} "
+                              f"({'are' if n > 1 else 'is'}) confirmed for tonight but your wallet is "
+                              f"short by ${total_short:.0f}. Top up to secure their "
+                              f"spot{'s' if n > 1 else ''} — no other action needed."))
+                except Exception as e:
+                    logger.warning(f"Could not DM guest payment reminder to {muid}: {e}")
+        # DM super-admin summary
+        if (confirmed_guests or pending_payment) and SUPER_ADMIN_ID:
+            lines = []
+            if confirmed_guests:
+                lines.append(f"✅ {len(confirmed_guests)} guest(s) confirmed &amp; charged:")
+                for mu, gn in confirmed_guests:
+                    lines.append(f"  • @{mu} brought {gn}")
+            if pending_payment:
+                lines.append(f"\n⚠️ {len(pending_payment)} guest(s) pending top-up:")
+                for mu, uid, gn, s in pending_payment:
+                    lines.append(f"  • @{mu} brought {gn} (short ${s:.0f})")
+            try:
+                await self.application.bot.send_message(
+                    chat_id=SUPER_ADMIN_ID, text="\n".join(lines))
+            except Exception as e:
+                logger.warning(f"Could not DM admin guest close summary: {e}")
         """Show all registered groups as inline buttons; tapping one sets the active group."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -2914,9 +3339,18 @@ class SoccerBotV2:
         return None, "❌ No active group set. Run /switchgroup to choose a group."
 
     async def handle_late_arrivals_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin's response to late arrivals prompt"""
+        """Handle admin's response to late arrivals prompt — also handles UX-4 guest name/number replies."""
         user_id = update.effective_user.id
-        
+
+        # UX-4: guest add state
+        if user_id in self._pending_guest_add:
+            await self._handle_guest_add_reply(update, context)
+            return
+        # UX-4: guest remove state
+        if user_id in self._pending_guest_remove:
+            await self._handle_guest_remove_reply(update, context)
+            return
+
         # Check if this admin has a pending late arrivals prompt
         if user_id not in self._pending_late_arrivals:
             return
@@ -3121,6 +3555,20 @@ class SoccerBotV2:
         for i, name in enumerate(players_in, 1):
             safe = name.replace('_', '\\_')
             text += f"{i}. {safe}\n"
+
+        # Confirmed guests section
+        gc = sqlite3.connect(DB_FILE)
+        gcc = gc.cursor()
+        gcc.execute("""SELECT member_username, guest_name FROM quickpoll_guests
+                       WHERE poll_id = ? AND confirmed = 1 ORDER BY added_at ASC""", (poll_id,))
+        confirmed_guests = gcc.fetchall()
+        gc.close()
+        if confirmed_guests:
+            text += f"\n👥 *+1 Guests ({len(confirmed_guests)} confirmed)*\n"
+            for i, (mu, gname) in enumerate(confirmed_guests, 1):
+                safe_mu = mu.replace('_', '\\_') if mu else '?'
+                safe_gn = gname.replace('_', '\\_')
+                text += f'{i}. @{safe_mu} brought "{safe_gn}"\n'
         
         if force_send:
             await self.application.bot.send_message(
@@ -3163,6 +3611,9 @@ class SoccerBotV2:
 
         # Disable the poll buttons
         await self.close_quickpoll_buttons(chat_id, poll_msg_id)
+
+        # Confirm guests (charge inviters for spots, notify short wallets)
+        await self.confirm_quickpoll_guests(poll_id, chat_id)
 
         # Post the roster (goes to admin approval unless force_send=True)
         await self.post_roster(poll_id, chat_id)
@@ -3486,7 +3937,26 @@ class SoccerBotV2:
                 self.credit_wallet(target, VOTE_COST, f"quickpoll_refund:{poll_id}")
 
         await self.refresh_quickpoll_message(poll_id)
-        await self.send(update, f"✅ @{target} removed.")
+
+        # Check if removed player had guests — prompt admin to decide
+        gc = sqlite3.connect(DB_FILE)
+        gcc = gc.cursor()
+        gcc.execute("SELECT id, guest_name FROM quickpoll_guests WHERE poll_id = ? AND LOWER(member_username) = LOWER(?)",
+                    (poll_id, target))
+        guest_rows = gcc.fetchall()
+        gc.close()
+        if guest_rows:
+            n = len(guest_rows)
+            names = ', '.join(g[1] for g in guest_rows)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Yes, remove all", callback_data=f"qgrm:all:{poll_id}:{target}"),
+                InlineKeyboardButton("Keep on waitlist", callback_data=f"qgrm:keep:{poll_id}:{target}"),
+            ]])
+            await self.send(update,
+                            f"✅ @{target} removed. They had {n} guest{'s' if n > 1 else ''}: {names}.\n\nRemove their guests too?",
+                            reply_markup=kb)
+        else:
+            await self.send(update, f"✅ @{target} removed.")
 
     async def finalize_teams(self, poll_id: int, chat_id: int, admin_id: int):
         """Called at deadline - creates balanced teams and posts to group"""
@@ -3694,6 +4164,7 @@ class SoccerBotV2:
                         cconn.close()
                         if qp_row and qp_row[0]:
                             await self.close_quickpoll_buttons(qp_chat_id, qp_row[0])
+                        await self.confirm_quickpoll_guests(qp_poll_id, qp_chat_id)
                         await self.post_roster(qp_poll_id, qp_chat_id)
                     elif event_type == 'finalize_teams':
                         await self.finalize_teams(payload['poll_id'], payload['chat_id'], payload['admin_id'])
@@ -3813,8 +4284,9 @@ class SoccerBotV2:
         res = c.fetchone()
         poll_msg_id = res[0] if res else None
 
-        # Clear votes so refund can't happen twice
+        # Clear votes so refund can't happen twice; clear guests (no charges yet at cancel)
         c.execute("DELETE FROM quickpoll_votes WHERE poll_id = ?", (poll_id,))
+        c.execute("DELETE FROM quickpoll_guests WHERE poll_id = ?", (poll_id,))
         conn.commit()
         conn.close()
 
@@ -3899,6 +4371,17 @@ class SoccerBotV2:
 
     async def unknown_message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Warm reply for unexpected messages in private chat."""
+        user_id = update.effective_user.id
+        # Clear any pending guest states if user sends /cancel or any unrecognised text
+        if update.message and update.message.text and update.message.text.strip().lower() == '/cancel':
+            cleared = False
+            if self._pending_guest_add.pop(user_id, None):
+                cleared = True
+            if self._pending_guest_remove.pop(user_id, None):
+                cleared = True
+            if cleared:
+                await self.send(update, "Cancelled.")
+                return
         import random
         responses = [
             "Hmm, not sure what to do with that one\\! Try /wallet to check your balance or /topup to add funds\\.",
