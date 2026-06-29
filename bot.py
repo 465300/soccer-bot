@@ -3,6 +3,8 @@ Soccer Bot v2 - Season-based poll automation with webhook + DB scheduling
 """
 
 import os
+import csv
+import io
 import html
 import json
 import asyncio
@@ -56,6 +58,9 @@ AWAITING_LATE_ARRIVALS_INPUT = 110
 # Pre-fill check state for quickpoll repeat
 QP_REPEAT_CHECK = 111
 
+# State for field cost input in quickpoll wizard
+QP_FIELD_RATE = 112
+
 # States for wallet conversations (custom top-up amount, cash-out)
 TOPUP_CUSTOM_AMOUNT = 120
 CASHOUT_AMOUNT, CASHOUT_HANDLE = 121, 122
@@ -88,6 +93,7 @@ ADMIN_COMMANDS = {
     'sendvenmolink', 'waive', 'initchats',
     'addplayer', 'removeplayer', 'nudge',
     'addmember', 'removemember', 'members',
+    'pollreport',
     # Admins get everything except the money commands below.
     'addadmin', 'removeadmin', 'listadmins', 'wallethistory',
     'switchgroup', 'mygroups',
@@ -264,6 +270,7 @@ class SoccerBotV2:
             BotCommand('removeadmin', 'Revoke admin access — /removeadmin @username'),
             BotCommand('listadmins', 'See all admins for a group'),
             BotCommand('wallethistory', 'Full transaction history for a player — /wallethistory @user'),
+            BotCommand('pollreport', 'Game attendance CSV — /pollreport 2026-05 or /pollreport 2026-05-01 2026-06-30'),
         ]
         super_cmds = [
             BotCommand('voidpayment', 'Reverse a payment — /voidpayment <id>'),
@@ -546,6 +553,11 @@ class SoccerBotV2:
         # the admin-only override on buttons after a poll ends
         try:
             c.execute("ALTER TABLE quickpolls ADD COLUMN closed INTEGER DEFAULT 0")
+        except:
+            pass
+        # Path B: field cost paid by admin for each session
+        try:
+            c.execute("ALTER TABLE quickpolls ADD COLUMN field_rate REAL")
         except:
             pass
         # Add member_type column for regular/drop-in players
@@ -1535,6 +1547,123 @@ class SoccerBotV2:
             "Waiver is consumed automatically when they vote IN.",
             parse_mode='Markdown')
 
+    async def pollreport_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Generate a CSV of closed quickpolls for a date range or month.
+        Usage:
+          /pollreport 2026-05              → full month
+          /pollreport 2026-05-01 2026-06-30  → custom range
+        """
+        user = update.effective_user
+        if not (self.is_super_admin(user.id) or self.is_admin_any_chat(user.id, user.username)):
+            await self.send(update, "❌ Admin only.")
+            return
+
+        args = context.args
+        start_date = end_date = None
+        USAGE = "Usage:\n`/pollreport 2026-05`  → full month\n`/pollreport 2026-05-01 2026-06-30`  → custom range"
+
+        if len(args) == 1:
+            try:
+                dt = datetime.strptime(args[0], "%Y-%m")
+                start_date = dt.replace(day=1)
+                if dt.month == 12:
+                    end_date = dt.replace(day=31)
+                else:
+                    end_date = dt.replace(month=dt.month + 1, day=1) - timedelta(days=1)
+            except ValueError:
+                await self.send(update, USAGE, parse_mode='Markdown')
+                return
+        elif len(args) == 2:
+            try:
+                start_date = datetime.strptime(args[0], "%Y-%m-%d")
+                end_date = datetime.strptime(args[1], "%Y-%m-%d")
+            except ValueError:
+                await self.send(update, USAGE, parse_mode='Markdown')
+                return
+        else:
+            await self.send(update, USAGE, parse_mode='Markdown')
+            return
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""SELECT q.id, q.game_date, q.location_name, q.max_players, q.field_rate,
+                            COUNT(CASE WHEN v.vote_type='in' THEN 1 END) as in_count,
+                            COUNT(CASE WHEN v.vote_type='out' THEN 1 END) as out_count
+                     FROM quickpolls q
+                     LEFT JOIN quickpoll_votes v ON v.poll_id = q.id
+                     WHERE q.closed = 1
+                     GROUP BY q.id""")
+        rows = c.fetchall()
+
+        DATE_FORMATS = ["%Y-%m-%d", "%m/%d/%Y", "%m/%d", "%b %d", "%B %d", "%B %d, %Y"]
+
+        def parse_game_date(raw):
+            if not raw:
+                return None
+            for fmt in DATE_FORMATS:
+                try:
+                    d = datetime.strptime(raw.strip(), fmt)
+                    if d.year == 1900:
+                        d = d.replace(year=datetime.now().year)
+                    return d
+                except ValueError:
+                    continue
+            return None
+
+        results = []
+        for poll_id, game_date_raw, location, max_players, field_rate, in_count, out_count in rows:
+            d = parse_game_date(game_date_raw)
+            if not d:
+                continue
+            if not (start_date <= d <= end_date):
+                continue
+
+            gc_count = c.execute("""SELECT COUNT(*) FROM quickpoll_guests
+                                    WHERE poll_id = ? AND confirmed IN (1, 2)""",
+                                 (poll_id,)).fetchone()[0]
+            voters = c.execute("""SELECT username FROM quickpoll_votes
+                                  WHERE poll_id = ? AND vote_type = 'in'
+                                  ORDER BY voted_at ASC""", (poll_id,)).fetchall()
+            player_list = "; ".join(r[0] for r in voters)
+            rate_pct = f"{round(in_count / max_players * 100)}%" if max_players and in_count else ""
+            total_units = in_count + gc_count
+            per_player = f"${field_rate / total_units:.2f}" if field_rate and total_units else ""
+
+            results.append({
+                "game_date": d.strftime("%Y-%m-%d"),
+                "location": location or "",
+                "total_in": in_count,
+                "total_out": out_count,
+                "total_guests": gc_count,
+                "participation_rate": rate_pct,
+                "field_rate": f"${field_rate:.2f}" if field_rate else "",
+                "per_player_charge": per_player,
+                "players": player_list,
+            })
+        conn.close()
+
+        if not results:
+            await self.send(update, "No closed polls found for that period.")
+            return
+
+        results.sort(key=lambda r: r["game_date"])
+
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=["game_date", "location", "total_in", "total_out",
+                                                  "total_guests", "participation_rate",
+                                                  "field_rate", "per_player_charge", "players"])
+        writer.writeheader()
+        writer.writerows(results)
+        csv_bytes = buf.getvalue().encode('utf-8')
+
+        label = args[0].replace('-', '_') if len(args) == 1 else f"{args[0]}_to_{args[1]}"
+        filename = f"poll_report_{label}.csv"
+        await update.message.reply_document(
+            document=io.BytesIO(csv_bytes),
+            filename=filename,
+            caption=f"📊 {len(results)} game{'s' if len(results) != 1 else ''} — {start_date.strftime('%b %d')} to {end_date.strftime('%b %d, %Y')}"
+        )
+
     async def initchats_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/initchats — Broadcast a DM-invite message to all groups you manage."""
         user_id = update.effective_user.id
@@ -1999,69 +2128,38 @@ class SoccerBotV2:
         conn.commit()
         conn.close()
 
-        # Money: charge on entering 'in', refund on leaving 'in'
-        # Waiver skips the charge (and means no refund due on OUT)
-        charged = False
+        # Path B: no charge at vote time — charges happen at close based on
+        # field_rate / total headcount. Waiver is still consumed for audit.
         waiver_used = False
-        if old_vote != 'in' and vote_type == 'in':
-            if active_waiver_id:
-                # Consume the waiver — no charge. Write a $0 audit row tying the
-                # waiver to the real game it covered + the admin who granted it.
-                now = datetime.now(TZ).isoformat()
-                wconn = sqlite3.connect(DB_FILE)
-                wc2 = wconn.cursor()
-                wc2.execute("UPDATE waivers SET used = 1, used_at = ? WHERE id = ?", (now, active_waiver_id))
-                wc2.execute("SELECT granted_by FROM waivers WHERE id = ?", (active_waiver_id,))
-                grow = wc2.fetchone()
-                granted_by = grow[0] if grow and grow[0] else "unknown"
-                wc2.execute("SELECT location_name, game_date FROM quickpolls WHERE id = ?", (poll_id,))
-                qrow = wc2.fetchone()
-                loc = qrow[0] if qrow else "?"
-                gdate = qrow[1] if qrow and qrow[1] else "?"
-                audit_note = f"waiver:#{poll_id} {gdate} @ {loc} · granted by @{granted_by}"
-                wc2.execute("""INSERT INTO payment_confirmations
-                              (username, amount, confirmed_date, status, notes)
-                              VALUES (?, 0, ?, 'waived', ?)""",
-                           (username, now, audit_note))
-                wconn.commit()
-                wconn.close()
-                waiver_used = True
-            else:
-                self.deduct_wallet(username, VOTE_COST, f"quickpoll_vote:{poll_id}")
-                charged = True
-        elif old_vote == 'in' and vote_type != 'in':
-            # Only refund if a charge actually exists for this poll
-            rconn = sqlite3.connect(DB_FILE)
-            rc = rconn.cursor()
-            rc.execute("""SELECT 1 FROM payment_confirmations
-                          WHERE LOWER(username) = LOWER(?) AND notes = ? AND amount < 0""",
-                       (username, f"quickpoll_vote:{poll_id}"))
-            was_charged = rc.fetchone() is not None
-            rconn.close()
-            if was_charged:
-                self.credit_wallet(username, VOTE_COST, f"quickpoll_refund:{poll_id}")
+        if old_vote != 'in' and vote_type == 'in' and active_waiver_id:
+            now = datetime.now(TZ).isoformat()
+            wconn = sqlite3.connect(DB_FILE)
+            wc2 = wconn.cursor()
+            wc2.execute("UPDATE waivers SET used = 1, used_at = ? WHERE id = ?", (now, active_waiver_id))
+            wc2.execute("SELECT granted_by FROM waivers WHERE id = ?", (active_waiver_id,))
+            grow = wc2.fetchone()
+            granted_by = grow[0] if grow and grow[0] else "unknown"
+            wc2.execute("SELECT location_name, game_date FROM quickpolls WHERE id = ?", (poll_id,))
+            qrow = wc2.fetchone()
+            loc = qrow[0] if qrow else "?"
+            gdate = qrow[1] if qrow and qrow[1] else "?"
+            audit_note = f"waiver:#{poll_id} {gdate} @ {loc} · granted by @{granted_by}"
+            wc2.execute("""INSERT INTO payment_confirmations
+                          (username, amount, confirmed_date, status, notes)
+                          VALUES (?, 0, ?, 'waived', ?)""",
+                       (username, now, audit_note))
+            wconn.commit()
+            wconn.close()
+            waiver_used = True
 
         # Confirmation popup
         if vote_type == 'in':
             if waiver_used:
-                await self._safe_answer(query, "✅ You're IN — waiver used (no charge this time).")
+                await self._safe_answer(query, "✅ You're IN — waiver noted. You'll be charged at close based on the final headcount.")
             else:
-                await self._safe_answer(query, f"✅ You're IN — ${VOTE_COST:.0f} deducted from your wallet.")
+                await self._safe_answer(query, "✅ You're IN — you'll be charged at close based on the final headcount.")
         else:
-            note = f" ${VOTE_COST:.0f} refunded." if (old_vote == 'in' and not waiver_used) else ""
-            await self._safe_answer(query, f"❌ You're OUT.{note}")
-
-        # Low-balance nudge after a charge
-        if charged:
-            wallet = self.get_wallet(username)
-            if wallet and wallet['balance'] <= WALLET_FLOOR:
-                try:
-                    await self.application.bot.send_message(
-                        chat_id=user.id,
-                        text=self.low_balance_text(wallet['balance']),
-                        parse_mode='Markdown')
-                except Exception as e:
-                    logger.warning(f"Could not send low-balance nudge to {user.id}: {e}")
+            await self._safe_answer(query, "❌ You're OUT.")
 
         # UX-4: when switching OUT, prompt about existing guests (fire-and-forget DM)
         if old_vote == 'in' and vote_type == 'out':
@@ -2289,31 +2387,31 @@ class SoccerBotV2:
         self.schedule_quickpoll_refresh(poll_id)
 
     async def confirm_quickpoll_guests(self, poll_id: int, chat_id: int):
-        """At close: walk the guest waitlist, fill remaining spots, charge inviters."""
+        """At close: confirm guest spots, then charge all IN players based on
+        field_rate / total units (Path B — no upfront charge)."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT max_players FROM quickpolls WHERE id = ?", (poll_id,))
+        c.execute("SELECT max_players, field_rate FROM quickpolls WHERE id = ?", (poll_id,))
         row = c.fetchone()
         if not row:
             conn.close()
             return
-        max_players = row[0] or 0
+        max_players, field_rate = row
+        max_players = max_players or 0
+
         c.execute("SELECT COUNT(*) FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
         in_count = c.fetchone()[0]
-        remaining = max(0, max_players - in_count) if max_players else 0
-        # All waitlisted guests, ordered by time added
+        remaining = max(0, max_players - in_count) if max_players else 999
+
+        # --- Step 1: Allocate guest spots (no money yet) ---
         c.execute("""SELECT id, member_username, member_user_id, guest_name
                      FROM quickpoll_guests WHERE poll_id = ? AND confirmed = 0
                      ORDER BY added_at ASC""", (poll_id,))
         guests = c.fetchall()
         conn.close()
-        if not guests:
-            return
-        confirmed_guests = []
-        pending_payment: list[tuple] = []  # (username, user_id, guest_name, shortfall)
+
         spots_used = 0
         for gid, member_username, member_user_id, guest_name in guests:
-            # Inviter must still be IN at close
             vc = sqlite3.connect(DB_FILE)
             vcc = vc.cursor()
             vcc.execute("SELECT vote_type FROM quickpoll_votes WHERE poll_id = ? AND LOWER(username) = LOWER(?)",
@@ -2321,7 +2419,6 @@ class SoccerBotV2:
             vote_row = vcc.fetchone()
             vc.close()
             if not vote_row or vote_row[0] != 'in':
-                # Inviter not IN — drop silently
                 dc = sqlite3.connect(DB_FILE)
                 dcc = dc.cursor()
                 dcc.execute("DELETE FROM quickpoll_guests WHERE id = ?", (gid,))
@@ -2329,63 +2426,112 @@ class SoccerBotV2:
                 dc.close()
                 continue
             if spots_used >= remaining:
-                continue  # No spot — leave as waitlisted (not dropped)
-            # Check wallet
-            wallet = self.get_wallet(member_username)
-            balance = wallet['balance'] if wallet else 0
-            if balance - VOTE_COST >= WALLET_FLOOR:
-                self.deduct_wallet(member_username, VOTE_COST, f"quickpoll_guest:{poll_id}")
-                uc = sqlite3.connect(DB_FILE)
-                ucc = uc.cursor()
-                ucc.execute("UPDATE quickpoll_guests SET confirmed = 1 WHERE id = ?", (gid,))
-                uc.commit()
-                uc.close()
-                confirmed_guests.append((member_username, guest_name))
-                spots_used += 1
-            else:
-                shortfall = round(VOTE_COST - (balance - WALLET_FLOOR), 2)
-                uc = sqlite3.connect(DB_FILE)
-                ucc = uc.cursor()
-                ucc.execute("UPDATE quickpoll_guests SET confirmed = 2 WHERE id = ?", (gid,))
-                uc.commit()
-                uc.close()
-                pending_payment.append((member_username, member_user_id, guest_name, shortfall))
-                spots_used += 1  # Hold the spot; pending top-up secures it
-        # DM inviters who are short (one DM per inviter covering all their guests)
-        inviters_notified: set = set()
-        for mu, muid, gname, shortfall in pending_payment:
-            if mu in inviters_notified:
-                continue
-            inviters_notified.add(mu)
-            their = [(u, uid, g, s) for u, uid, g, s in pending_payment if u == mu]
-            n = len(their)
-            total_short = sum(s for *_, s in their)
-            if muid:
+                continue  # No spot — leave waitlisted
+            uc = sqlite3.connect(DB_FILE)
+            ucc = uc.cursor()
+            ucc.execute("UPDATE quickpoll_guests SET confirmed = 1 WHERE id = ?", (gid,))
+            uc.commit()
+            uc.close()
+            spots_used += 1
+
+        # --- Step 2: Charge all IN players ---
+        if not field_rate:
+            if SUPER_ADMIN_ID:
                 try:
                     await self.application.bot.send_message(
-                        chat_id=muid,
-                        text=(f"⚠️ Your {n} guest{'s' if n > 1 else ''} "
-                              f"({'are' if n > 1 else 'is'}) confirmed for tonight but your wallet is "
-                              f"short by ${total_short:.0f}. Top up to secure their "
-                              f"spot{'s' if n > 1 else ''} — no other action needed."))
+                        chat_id=SUPER_ADMIN_ID,
+                        text=f"ℹ️ Poll #{poll_id} closed — no field rate was set, so no charges were made.")
+                except Exception:
+                    pass
+            return
+
+        gc = sqlite3.connect(DB_FILE)
+        gcc = gc.cursor()
+        gcc.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND confirmed IN (1, 2)", (poll_id,))
+        total_confirmed_guests = gcc.fetchone()[0]
+        gcc.execute("SELECT username, user_id FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
+        in_voters = gcc.fetchall()
+        gc.close()
+
+        total_units = len(in_voters) + total_confirmed_guests
+        if total_units == 0:
+            return
+        per_unit = round(field_rate / total_units, 2)
+
+        charged_ok = []
+        shortfalls = []
+
+        for voter_username, voter_user_id in in_voters:
+            # Waiver holders pay nothing at close
+            wc = sqlite3.connect(DB_FILE)
+            wcc = wc.cursor()
+            wcc.execute("""SELECT 1 FROM payment_confirmations
+                           WHERE LOWER(username) = LOWER(?) AND notes LIKE ? AND status = 'waived'""",
+                        (voter_username, f"waiver:#{poll_id}%"))
+            is_waived = wcc.fetchone() is not None
+            wc.close()
+            if is_waived:
+                continue
+
+            gfc = sqlite3.connect(DB_FILE)
+            gfcc = gfc.cursor()
+            gfcc.execute("""SELECT COUNT(*) FROM quickpoll_guests
+                            WHERE poll_id = ? AND confirmed IN (1, 2) AND LOWER(member_username) = LOWER(?)""",
+                         (poll_id, voter_username))
+            guest_count = gfcc.fetchone()[0]
+            gfc.close()
+
+            amount_due = round(per_unit * (1 + guest_count), 2)
+            wallet = self.get_wallet(voter_username)
+            balance = wallet['balance'] if wallet else 0
+
+            if balance >= amount_due:
+                self.deduct_wallet(voter_username, amount_due, f"quickpoll_vote:{poll_id}")
+                charged_ok.append((voter_username, amount_due, guest_count))
+            else:
+                shortfall = round(amount_due - balance, 2)
+                shortfalls.append((voter_username, voter_user_id, amount_due, guest_count, shortfall))
+                now_iso = datetime.now(TZ).isoformat()
+                sc = sqlite3.connect(DB_FILE)
+                scc = sc.cursor()
+                scc.execute("""INSERT INTO payment_confirmations
+                               (username, amount, payment_date, confirmed_date, status, notes)
+                               VALUES (?, ?, ?, ?, 'pending', ?)""",
+                            (voter_username, -amount_due, now_iso, now_iso, f"quickpoll_vote:{poll_id}:shortfall"))
+                sc.commit()
+                sc.close()
+
+        # DM players with shortfalls
+        for voter_username, voter_user_id, amount_due, guest_count, shortfall in shortfalls:
+            if voter_user_id:
+                try:
+                    guest_note = f" (covering you + {guest_count} guest{'s' if guest_count > 1 else ''})" if guest_count else ""
+                    await self.application.bot.send_message(
+                        chat_id=voter_user_id,
+                        text=(f"⚠️ Your share for today's game was ${amount_due:.2f}{guest_note}, "
+                              f"but your wallet only has ${(amount_due - shortfall):.2f}. "
+                              f"You're short ${shortfall:.2f}. Please top up to cover the balance."))
                 except Exception as e:
-                    logger.warning(f"Could not DM guest payment reminder to {muid}: {e}")
+                    logger.warning(f"Could not DM shortfall notice to {voter_user_id}: {e}")
+
         # DM super-admin summary
-        if (confirmed_guests or pending_payment) and SUPER_ADMIN_ID:
-            lines = []
-            if confirmed_guests:
-                lines.append(f"✅ {len(confirmed_guests)} guest(s) confirmed &amp; charged:")
-                for mu, gn in confirmed_guests:
-                    lines.append(f"  • @{mu} brought {gn}")
-            if pending_payment:
-                lines.append(f"\n⚠️ {len(pending_payment)} guest(s) pending top-up:")
-                for mu, uid, gn, s in pending_payment:
-                    lines.append(f"  • @{mu} brought {gn} (short ${s:.0f})")
+        if SUPER_ADMIN_ID and (charged_ok or shortfalls):
+            lines = [f"💰 Poll #{poll_id} closed — ${per_unit:.2f}/unit ({total_units} units, ${field_rate:.2f} field):"]
+            if charged_ok:
+                lines.append(f"\n✅ Charged ({len(charged_ok)}):")
+                for u, amt, gc_count in charged_ok:
+                    g = f" +{gc_count}g" if gc_count else ""
+                    lines.append(f"  • @{u}{g}: ${amt:.2f}")
+            if shortfalls:
+                lines.append(f"\n⚠️ Shortfalls ({len(shortfalls)}):")
+                for u, uid, amt, gc_count, sf in shortfalls:
+                    g = f" +{gc_count}g" if gc_count else ""
+                    lines.append(f"  • @{u}{g}: owes ${amt:.2f} (short ${sf:.2f})")
             try:
                 await self.application.bot.send_message(
                     chat_id=SUPER_ADMIN_ID, text="\n".join(lines))
             except Exception as e:
-                logger.warning(f"Could not DM admin guest close summary: {e}")
+                logger.warning(f"Could not DM admin close summary: {e}")
 
     async def switchgroup_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show all registered groups as inline buttons; tapping one sets the active group."""
@@ -3204,7 +3350,7 @@ class SoccerBotV2:
             except ValueError:
                 await self.send(update, "Please enter a number:")
                 return QP_MAX_PLAYERS
-        await self.send(update, "Step 8/9: Enter *voting deadline* in hours (e.g., 24), or *skip* for no deadline:", parse_mode='Markdown')
+        await self.send(update, "Step 8/10: Enter *voting deadline* in hours (e.g., 24), or *skip* for no deadline:", parse_mode='Markdown')
         return QP_DEADLINE
 
     async def qp_get_deadline(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3213,14 +3359,15 @@ class SoccerBotV2:
             context.user_data['qp']['deadline_hours'] = None
             context.user_data['qp']['auto_teams'] = False
             context.user_data['qp']['num_teams'] = context.user_data['qp'].get('num_teams', 0)
-            return await self._send_quickpoll_final(update, context)
+            await self.send(update, "Last step: What did you pay for the field? (e.g. 82, or *skip*):", parse_mode='Markdown')
+            return QP_FIELD_RATE
         try:
             hours = float(text)
         except ValueError:
             await self.send(update, "Please enter a number of hours, or *skip* for no deadline:", parse_mode='Markdown')
             return QP_DEADLINE
         context.user_data['qp']['deadline_hours'] = hours
-        await self.send(update, "Step 9/9: Auto-create teams when voting closes? (*yes* or *no*):", parse_mode='Markdown')
+        await self.send(update, "Step 9/10: Auto-create teams when voting closes? (*yes* or *no*):", parse_mode='Markdown')
         return QP_AUTO_TEAMS
 
     async def qp_get_auto_teams(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3232,7 +3379,8 @@ class SoccerBotV2:
         elif answer in ('no', 'n'):
             context.user_data['qp']['auto_teams'] = False
             context.user_data['qp']['num_teams'] = 0
-            return await self._send_quickpoll_final(update, context)
+            await self.send(update, "Last step: What did you pay for the field? (e.g. 82, or *skip*):", parse_mode='Markdown')
+            return QP_FIELD_RATE
         else:
             await self.send(update, "Please answer *yes* or *no*:")
             return QP_AUTO_TEAMS
@@ -3247,7 +3395,22 @@ class SoccerBotV2:
             return QP_NUM_TEAMS
         
         context.user_data['qp']['num_teams'] = num_teams
-        await self.send(update, "✅ Step 10/10: Sending poll...")
+        await self.send(update, "Last step: What did you pay for the field? (e.g. 82, or *skip*):", parse_mode='Markdown')
+        return QP_FIELD_RATE
+
+    async def qp_get_field_rate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip().lower()
+        if text in ('skip', 'no', 'n', '0'):
+            context.user_data['qp']['field_rate'] = None
+        else:
+            try:
+                rate = float(text.lstrip('$'))
+                if rate < 0:
+                    raise ValueError
+                context.user_data['qp']['field_rate'] = rate
+            except ValueError:
+                await self.send(update, "Please enter a dollar amount (e.g. 82), or *skip*:", parse_mode='Markdown')
+                return QP_FIELD_RATE
         return await self._send_quickpoll_final(update, context)
 
     async def _send_quickpoll_final(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3276,7 +3439,8 @@ class SoccerBotV2:
             max_players=qp['max_players'],
             deadline_time=deadline_time,
             num_teams=qp.get('num_teams', 0),
-            admin_id=qp['admin_id']
+            admin_id=qp['admin_id'],
+            field_rate=qp.get('field_rate')
         )
         
         if deadline_time:
@@ -3314,7 +3478,7 @@ class SoccerBotV2:
 
     async def send_quickpoll(self, chat_id: int, location_name: str, location_link: str, 
                              game_date: str, time_start: str, time_end: str, max_players: int,
-                             deadline_time, num_teams: int, admin_id: int):
+                             deadline_time, num_teams: int, admin_id: int, field_rate: float = None):
         """Send a quick poll using native Telegram poll with reply-to trick"""
         
         poll_id = int(datetime.now().timestamp())
@@ -3324,10 +3488,10 @@ class SoccerBotV2:
         deadline_iso = deadline_time.isoformat() if deadline_time else None
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute('''INSERT INTO quickpolls (id, location_name, location_link, max_players, deadline_time, num_teams, chat_id, admin_id, telegram_poll_id, poll_message_id, game_date, time_start, time_end)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        c.execute('''INSERT INTO quickpolls (id, location_name, location_link, max_players, deadline_time, num_teams, chat_id, admin_id, telegram_poll_id, poll_message_id, game_date, time_start, time_end, field_rate)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                   (poll_id, location_name, location_link, max_players, deadline_iso, num_teams, chat_id, admin_id,
-                   None, None, game_date, time_start, time_end))
+                   None, None, game_date, time_start, time_end, field_rate))
 
         # Link any pending late arrivals from previous polls to this new poll
         # (auto-link for next poll feature)
@@ -4021,13 +4185,14 @@ class SoccerBotV2:
         if was_in:
             rconn = sqlite3.connect(DB_FILE)
             rc = rconn.cursor()
-            rc.execute("""SELECT 1 FROM payment_confirmations
-                          WHERE LOWER(username) = LOWER(?) AND notes = ? AND amount < 0""",
-                       (target, f"quickpoll_vote:{poll_id}"))
-            was_charged = rc.fetchone() is not None
+            rc.execute("""SELECT ABS(amount) FROM payment_confirmations
+                          WHERE LOWER(username) = LOWER(?) AND notes LIKE ? AND amount < 0
+                          ORDER BY id DESC LIMIT 1""",
+                       (target, f"quickpoll_vote:{poll_id}%"))
+            charge_row = rc.fetchone()
             rconn.close()
-            if was_charged:
-                self.credit_wallet(target, VOTE_COST, f"quickpoll_refund:{poll_id}")
+            if charge_row:
+                self.credit_wallet(target, charge_row[0], f"quickpoll_refund:{poll_id}")
 
         await self.refresh_quickpoll_message(poll_id)
 
@@ -4474,13 +4639,7 @@ class SoccerBotV2:
             if payload.get('poll_id') == poll_id:
                 c.execute("UPDATE scheduled_events SET executed = 1 WHERE id = ?", (eid,))
 
-        # Collect IN voters for refund
-        c.execute("SELECT username FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
-        in_voters = [r[0] for r in c.fetchall()]
-
-        # Snapshot OUT voters to payment_confirmations (amount=0) so they can
-        # be recovered after an accidental cancel — OUT voters are never charged
-        # so without this record they are permanently lost.
+        # Snapshot OUT voters for audit trail
         c.execute("SELECT username FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'out'", (poll_id,))
         out_voters = [r[0] for r in c.fetchall()]
         now_iso = datetime.now(TZ).isoformat()
@@ -4495,7 +4654,7 @@ class SoccerBotV2:
         res = c.fetchone()
         poll_msg_id = res[0] if res else None
 
-        # Clear votes so refund can't happen twice; clear guests (no charges yet at cancel)
+        # Clear votes and guests; mark closed
         c.execute("DELETE FROM quickpoll_votes WHERE poll_id = ?", (poll_id,))
         c.execute("DELETE FROM quickpoll_guests WHERE poll_id = ?", (poll_id,))
         c.execute("UPDATE quickpolls SET closed = 1 WHERE id = ?", (poll_id,))
@@ -4505,16 +4664,7 @@ class SoccerBotV2:
         admin_id = update.effective_user.id
         await self.close_quickpoll_buttons(chat_id, poll_msg_id)
 
-        # Refund every IN voter
-        for voter in in_voters:
-            self.credit_wallet(voter, VOTE_COST, f"quickpoll_cancelled:{poll_id}")
-
-        refund_line = "💰 Full refund done — your money is safe." if in_voters else ""
-        group_text = (
-            f"❌ *Game cancelled.*\n\n"
-            f"📢 {reason}"
-            + (f"\n\n{refund_line}" if refund_line else "")
-        )
+        group_text = f"❌ *Game cancelled.*\n\n📢 {reason}"
         self._pending_cancels[f"{poll_id}:{chat_id}"] = group_text
         await self.request_approval(
             admin_id,
@@ -4523,7 +4673,7 @@ class SoccerBotV2:
             "Post cancellation notice to group?"
         )
 
-        await self.send(update, f"✅ Quick poll cancelled. {len(in_voters)} player(s) refunded ${VOTE_COST:.0f} each.")
+        await self.send(update, "✅ Quick poll cancelled.")
 
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Warm welcome message with role-aware guidance."""
@@ -4646,6 +4796,7 @@ class SoccerBotV2:
                 QP_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_deadline)],
                 QP_AUTO_TEAMS: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_auto_teams)],
                 QP_NUM_TEAMS: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_num_teams)],
+                QP_FIELD_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, self.qp_get_field_rate)],
             },
             fallbacks=[
                 CommandHandler('cancel', self.qp_cancel),
@@ -4732,6 +4883,7 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('wallethistory', self.wallethistory_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('waive', self.waive_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('initchats', self.initchats_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('pollreport', self.pollreport_cmd, filters=filters.ChatType.PRIVATE))
 
         # Approval callbacks (approve/discard buttons on admin DMs)
         self.application.add_handler(CallbackQueryHandler(self.handle_approval_callback, pattern='^(approve|discard):'))
