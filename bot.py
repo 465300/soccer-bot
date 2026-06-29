@@ -116,6 +116,7 @@ class SoccerBotV2:
         self._cqpg_pending: dict[int, tuple] = {}  # user_id -> (poll_id, chat_id, group_name) from group picker
         self._pending_pollreport: dict[int, dict] = {}  # user_id -> {chat_id, group_name} waiting for date input
         self._setfieldrate_pending: dict[int, dict] = {}  # user_id -> {stage, chat_id, group_name, poll_id} for /setfieldrate flow
+        self._grouppick_pending: dict[int, dict] = {}  # user_id -> {action, payload} awaiting a generic group pick
         self.init_database()
 
     async def send(self, update: Update, text: str, **kwargs):
@@ -663,6 +664,36 @@ class SoccerBotV2:
             c.execute("ALTER TABLE members ADD COLUMN is_display_name INTEGER DEFAULT 0")
         except:
             pass
+        # Stage 3: group-scope the nudge roster. Rebuild members with a composite
+        # PRIMARY KEY (username, chat_id) so the same player can live on multiple
+        # groups' rosters independently. Backfill existing rows to the legacy group.
+        try:
+            c.execute("PRAGMA table_info(members)")
+            _member_cols = {row[1] for row in c.fetchall()}
+            if 'chat_id' not in _member_cols:
+                c.execute("SELECT value FROM settings WHERE key = 'chat_id'")
+                _legacy = c.fetchone()
+                _legacy_chat_id = int(_legacy[0]) if _legacy and _legacy[0] else None
+                # Keep a one-time backup of the pre-migration roster for reversibility
+                c.execute("DROP TABLE IF EXISTS members_pre_groupscope")
+                c.execute("CREATE TABLE members_pre_groupscope AS SELECT * FROM members")
+                c.execute('''CREATE TABLE members_g (
+                    username TEXT COLLATE NOCASE,
+                    first_name TEXT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    member_type TEXT DEFAULT 'member',
+                    is_display_name INTEGER DEFAULT 0,
+                    chat_id INTEGER,
+                    PRIMARY KEY (username, chat_id))''')
+                c.execute('''INSERT OR IGNORE INTO members_g
+                             (username, first_name, added_at, member_type, is_display_name, chat_id)
+                             SELECT username, first_name, added_at, member_type, is_display_name, ?
+                             FROM members''', (_legacy_chat_id,))
+                c.execute("DROP TABLE members")
+                c.execute("ALTER TABLE members_g RENAME TO members")
+                logger.info(f"members table migrated to group-scoped schema (legacy chat_id={_legacy_chat_id})")
+        except Exception as e:
+            logger.error(f"members group-scope migration failed: {e}")
         # Cleanup: close quickpolls with past or non-ISO game dates (legacy test polls)
         today = datetime.now(TZ).date()
         c.execute("SELECT id, game_date FROM quickpolls WHERE closed = 0")
@@ -2052,6 +2083,9 @@ class SoccerBotV2:
         if query.data.startswith('sfr_group:'):
             await self.handle_setfieldrate_group_callback(query, query.data.split(':', 1)[1])
             return
+        if query.data.startswith('gpick:'):
+            await self.handle_grouppick_callback(update, query.data.split(':', 1)[1])
+            return
         if query.data == 'sfr_older':
             await self.handle_setfieldrate_older_callback(query)
             return
@@ -3287,67 +3321,81 @@ class SoccerBotV2:
         await self.send(update, f"✅ Cleared {updated} late arrival records for poll {poll_id}")
 
     async def maketeams_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Create balanced teams: /maketeams [all] (uses poll settings)"""
+        """Create balanced teams: /maketeams [all] [N]. Without 'all', resolves
+        the group (picker if you manage more than one) and uses that group's
+        latest poll, posting the teams back to that same group."""
         # Check admin authorization
         is_admin, _ = await self.check_admin(update)
         if not is_admin:
             await self.send(update, "❌ You are not authorized to use this command.")
             return
-        
+
         override_num = None
         use_all = False
-        
-        # Parse arguments
         for arg in context.args:
             if arg.isdigit():
                 n = int(arg)
                 if n >= 2: override_num = n
             elif arg.lower() == 'all':
                 use_all = True
-        
+
+        if use_all:
+            # Rated-players source isn't tied to a poll — post to the active group
+            await self._run_maketeams(update, None, override_num, True)
+            return
+        await self._resolve_group(update, 'maketeams', {'override_num': override_num},
+                                  require_poll=True, open_only=False)
+
+    async def _do_maketeams(self, update: Update, payload: dict, chat_id: int):
+        """Build teams from the resolved group's latest poll."""
+        await self._run_maketeams(update, chat_id, payload['override_num'], False)
+
+    async def _run_maketeams(self, update: Update, chat_id, override_num, use_all: bool):
+        """Core team builder. When use_all, draws from all rated players and posts
+        to the admin's active group; otherwise draws from chat_id's latest poll and
+        posts back to chat_id (no cross-group bleed)."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        
+
         players_with_skills = []
-        poll_num_teams = 2 # Default
-        
+        poll_num_teams = 2  # Default
+
         if use_all:
             # Source 1: All rated players
             c.execute("SELECT username, skill_rating FROM skills ORDER BY skill_rating DESC")
             rated_players = c.fetchall()
             players_with_skills = [{'username': username, 'skill': rating} for username, rating in rated_players]
-            
+
             if not players_with_skills:
                 await self.send(update, "❌ No rated players found. Use `/setskill` first.", parse_mode='Markdown')
                 conn.close()
                 return
 
         else:
-            # Source 2: Latest Quickpoll (Default)
-            # Try to get num_teams from the poll
+            # Source 2: This group's latest quickpoll
             try:
-                c.execute("SELECT id, num_teams FROM quickpolls ORDER BY created_at DESC LIMIT 1")
+                c.execute("SELECT id, num_teams FROM quickpolls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1", (chat_id,))
                 poll = c.fetchone()
             except sqlite3.OperationalError:
                 # Fallback if num_teams column missing (old schema)
-                c.execute("SELECT id FROM quickpolls ORDER BY created_at DESC LIMIT 1")
+                c.execute("SELECT id FROM quickpolls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1", (chat_id,))
                 row = c.fetchone()
                 poll = (row[0], 2) if row else None
-            
+
             if not poll:
                 await self.send(update, "❌ No quickpoll found. Use `/quickpoll` to start one, or `/maketeams all`.", parse_mode='Markdown')
                 conn.close()
                 return
-            
+
             poll_id = poll[0]
             poll_num_teams = poll[1]
-            
+
             # Get IN voters
             c.execute("SELECT user_id, username FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
             in_voters = c.fetchall()
 
             all_players = in_voters
-            
+
             if not all_players:
                 await self.send(update, "❌ No players voted IN yet. Use `/maketeams all`.", parse_mode='Markdown')
                 conn.close()
@@ -3359,24 +3407,27 @@ class SoccerBotV2:
                 skill = c.fetchone()
                 rating = skill[0] if skill else 3
                 players_with_skills.append({'username': username, 'skill': rating})
-        
+
         conn.close()
-        
+
         # Use override if provided, else use poll setting (or default 2)
         num_teams = override_num if override_num else poll_num_teams
-        
+
         if len(players_with_skills) < num_teams:
             await self.send(update, f"❌ Not enough players ({len(players_with_skills)}) for {num_teams} teams.")
             return
-        
+
         # Balance teams using greedy algorithm
         teams = self.balance_teams(players_with_skills, num_teams)
 
-        chat_id, group_name = self.get_admin_target_chat(update.effective_user.id)
-        if not chat_id:
-            await self.send(update, "❌ No active group set. Run /switchgroup first.")
-            return
-        
+        if use_all:
+            post_chat_id, _group_name = self.get_admin_target_chat(update.effective_user.id)
+            if not post_chat_id:
+                await self.send(update, "❌ No active group set. Run /switchgroup first.")
+                return
+        else:
+            post_chat_id = chat_id
+
         # Build and send message
         msg = "⚽ *Teams for Today's Game*\n\n"
         for i, team in enumerate(teams, 1):
@@ -3387,10 +3438,10 @@ class SoccerBotV2:
                 safe_name = p['username'].replace('_', '\\_')
                 msg += f"• @{safe_name} {stars}\n"
             msg += "\n"
-        
+
         msg += "Good luck! 🎉"
-        
-        await self.application.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+
+        await self.application.bot.send_message(chat_id=post_chat_id, text=msg, parse_mode='Markdown')
         await self.send(update, "✅ Teams posted to the group!")
 
     def balance_teams(self, players: list, num_teams: int) -> list:
@@ -4187,29 +4238,27 @@ class SoccerBotV2:
     async def closepoll_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Manually close the most recent quickpoll and post roster: /closepoll"""
         if update.effective_chat.type in ['group', 'supergroup']:
-            # Delete command message in group
+            # Delete command message in group, then target this group directly
             await self.delete_message_safely(update.effective_chat.id, update.message.message_id)
+            await self._do_closepoll(update, {}, update.effective_chat.id)
+            return
+        # Private DM — resolve which group's poll to close
+        await self._resolve_group(update, 'closepoll', {}, require_poll=True, open_only=False)
 
-        user_id = update.effective_user.id
+    async def _do_closepoll(self, update: Update, payload: dict, chat_id: int):
+        """Close the latest quickpoll in the resolved group."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        if update.effective_chat.type in ['group', 'supergroup']:
-            c.execute("SELECT id, chat_id, poll_message_id FROM quickpolls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1", (update.effective_chat.id,))
-        else:
-            c.execute("""
-                SELECT qp.id, qp.chat_id, qp.poll_message_id FROM quickpolls qp
-                JOIN chat_admins ca ON qp.chat_id = ca.chat_id
-                WHERE ca.user_id = ?
-                ORDER BY qp.created_at DESC LIMIT 1
-            """, (user_id,))
+        c.execute("SELECT id, poll_message_id FROM quickpolls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1",
+                  (chat_id,))
         poll = c.fetchone()
         conn.close()
 
         if not poll:
             await self.send(update, "❌ No quickpoll found to close.")
             return
-        
-        poll_id, chat_id, poll_msg_id = poll
+
+        poll_id, poll_msg_id = poll
 
         # Disable the poll buttons
         await self.close_quickpoll_buttons(chat_id, poll_msg_id)
@@ -4257,6 +4306,129 @@ class SoccerBotV2:
         conn.close()
         return row[0] if row else None
 
+    def _admin_groups(self, user_id: int):
+        """Registered groups this user can act on. Super admin sees all groups;
+        everyone else sees groups they administer. Returns [(chat_id, group_name), ...]."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        if self.is_super_admin(user_id):
+            c.execute("SELECT chat_id, group_name FROM chat_groups ORDER BY group_name")
+        else:
+            c.execute("""SELECT cg.chat_id, cg.group_name FROM chat_groups cg
+                         JOIN chat_admins ca ON cg.chat_id = ca.chat_id
+                         WHERE ca.user_id = ? ORDER BY cg.group_name""", (user_id,))
+        rows = c.fetchall()
+        conn.close()
+        return rows
+
+    def _latest_poll_in_chat(self, chat_id: int, open_only: bool = False):
+        """Most recent quickpoll in one group. open_only restricts to a poll that
+        isn't closed. Returns (poll_id, max_players, num_teams) or None."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        if open_only:
+            c.execute("""SELECT id, max_players, num_teams FROM quickpolls
+                         WHERE chat_id = ? AND closed = 0
+                         ORDER BY created_at DESC LIMIT 1""", (chat_id,))
+        else:
+            c.execute("""SELECT id, max_players, num_teams FROM quickpolls
+                         WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1""", (chat_id,))
+        row = c.fetchone()
+        conn.close()
+        return row
+
+    def _group_poll_label(self, chat_id: int, open_only: bool = False) -> str:
+        """': location — date' suffix for a group's latest poll, for picker buttons."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        if open_only:
+            c.execute("""SELECT location_name, game_date FROM quickpolls
+                         WHERE chat_id = ? AND closed = 0
+                         ORDER BY created_at DESC LIMIT 1""", (chat_id,))
+        else:
+            c.execute("""SELECT location_name, game_date FROM quickpolls
+                         WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1""", (chat_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return ""
+        loc, gd = row
+        date_str = self._pretty_date(gd) if gd else 'TBD'
+        return f": {loc} — {date_str}"
+
+    async def _resolve_group(self, update: Update, action: str, payload: dict,
+                             require_poll: bool = True, open_only: bool = False):
+        """Decide which group an admin command acts on, preventing cross-group bleed.
+        0 eligible groups → error; 1 → act immediately (no extra tap); >1 → group picker.
+        When require_poll, a group only counts if it has a (latest/open) poll."""
+        user = update.effective_user
+        groups = self._admin_groups(user.id)
+        eligible = []
+        for chat_id, name in groups:
+            if require_poll and not self._latest_poll_in_chat(chat_id, open_only):
+                continue
+            eligible.append((chat_id, name))
+        if not eligible:
+            if not require_poll:
+                msg = "❌ You don't manage any group yet. Register one with /setchat."
+            elif open_only:
+                msg = "❌ No open poll found in any group you manage."
+            else:
+                msg = "❌ No poll found in any group you manage."
+            await self.send(update, msg)
+            return
+        if len(eligible) == 1:
+            await self._dispatch_group_action(update, action, payload, eligible[0][0])
+            return
+        self._grouppick_pending[user.id] = {'action': action, 'payload': payload}
+        buttons = []
+        for chat_id, name in eligible:
+            detail = self._group_poll_label(chat_id, open_only) if require_poll else ""
+            buttons.append([InlineKeyboardButton(f"{name}{detail}"[:60], callback_data=f"gpick:{chat_id}")])
+        await self.send(update, "Which group?", reply_markup=InlineKeyboardMarkup(buttons))
+
+    async def handle_grouppick_callback(self, update: Update, chat_id_str: str):
+        """Admin tapped a group on a generic group picker → run the queued action."""
+        query = update.callback_query
+        pending = self._grouppick_pending.pop(query.from_user.id, None)
+        if not pending:
+            await query.answer()
+            await query.edit_message_text("Session expired. Run the command again.")
+            return
+        try:
+            chat_id = int(chat_id_str)
+        except ValueError:
+            await query.answer("Invalid selection.")
+            return
+        await query.answer()
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT group_name FROM chat_groups WHERE chat_id = ?", (chat_id,))
+        row = c.fetchone()
+        conn.close()
+        name = row[0] if row else str(chat_id)
+        await query.edit_message_text(f"✅ Group: {name}")
+        await self._dispatch_group_action(update, pending['action'], pending['payload'], chat_id)
+
+    async def _dispatch_group_action(self, update: Update, action: str, payload: dict, chat_id: int):
+        """Route a group-resolved action to its core handler."""
+        if action == 'addplayer':
+            await self._do_addplayer(update, payload, chat_id)
+        elif action == 'removeplayer':
+            await self._do_removeplayer(update, payload, chat_id)
+        elif action == 'closepoll':
+            await self._do_closepoll(update, payload, chat_id)
+        elif action == 'nudge':
+            await self._do_nudge(update, payload, chat_id)
+        elif action == 'maketeams':
+            await self._do_maketeams(update, payload, chat_id)
+        elif action == 'addmember':
+            await self._do_addmember(update, payload, chat_id)
+        elif action == 'removemember':
+            await self._do_removemember(update, payload, chat_id)
+        elif action == 'members':
+            await self._do_members(update, payload, chat_id)
+
     def latest_poll_for_admin(self, user_id: int):
         """The most recent quickpoll in any chat this user administers.
         Returns (poll_id, chat_id, max_players) or None."""
@@ -4278,20 +4450,28 @@ class SoccerBotV2:
             return
         # Join all args then split on commas so multi-word names work
         entries = [e.strip().strip('"').strip("'") for e in ' '.join(context.args).split(',')]
+        entries = [e for e in entries if e.lstrip('@').strip()]
+        if not entries:
+            await self.send(update, "Nothing to add.")
+            return
+        await self._resolve_group(update, 'addmember', {'entries': entries}, require_poll=False)
+
+    async def _do_addmember(self, update: Update, payload: dict, chat_id: int):
+        """Add the parsed roster entries to one group's nudge roster."""
         added_ping, added_display, existing = [], [], []
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        for raw in entries:
+        for raw in payload['entries']:
             is_display = not raw.startswith('@')
             name = raw.lstrip('@').strip()
             if not name:
                 continue
-            c.execute("SELECT 1 FROM members WHERE LOWER(username) = LOWER(?)", (name,))
+            c.execute("SELECT 1 FROM members WHERE LOWER(username) = LOWER(?) AND chat_id = ?", (name, chat_id))
             if c.fetchone():
                 existing.append((name, is_display))
             else:
-                c.execute("INSERT INTO members (username, first_name, is_display_name) VALUES (?, ?, ?)",
-                          (name, name, 1 if is_display else 0))
+                c.execute("INSERT INTO members (username, first_name, is_display_name, chat_id) VALUES (?, ?, ?, ?)",
+                          (name, name, 1 if is_display else 0, chat_id))
                 (added_display if is_display else added_ping).append(name)
         conn.commit()
         conn.close()
@@ -4311,14 +4491,22 @@ class SoccerBotV2:
             await self.send(update, "Usage: /removemember @username or /removemember Full Name\nMultiple: /removemember Ali Tarkhani, @user2")
             return
         entries = [e.strip().strip('"').strip("'") for e in ' '.join(context.args).split(',')]
+        entries = [e for e in entries if e.lstrip('@').strip()]
+        if not entries:
+            await self.send(update, "Nothing to remove.")
+            return
+        await self._resolve_group(update, 'removemember', {'entries': entries}, require_poll=False)
+
+    async def _do_removemember(self, update: Update, payload: dict, chat_id: int):
+        """Remove the parsed roster entries from one group's nudge roster."""
         removed, missing = [], []
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        for raw in entries:
+        for raw in payload['entries']:
             name = raw.lstrip('@').strip()
             if not name:
                 continue
-            c.execute("DELETE FROM members WHERE LOWER(username) = LOWER(?)", (name,))
+            c.execute("DELETE FROM members WHERE LOWER(username) = LOWER(?) AND chat_id = ?", (name, chat_id))
             (removed if c.rowcount else missing).append(name)
         conn.commit()
         conn.close()
@@ -4331,9 +4519,13 @@ class SoccerBotV2:
 
     async def members_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show the nudge roster."""
+        await self._resolve_group(update, 'members', {}, require_poll=False)
+
+    async def _do_members(self, update: Update, payload: dict, chat_id: int):
+        """Show one group's nudge roster (NULL chat_id = legacy global fallback)."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT username, is_display_name FROM members ORDER BY LOWER(username)")
+        c.execute("SELECT username, is_display_name FROM members WHERE chat_id = ? OR chat_id IS NULL ORDER BY LOWER(username)", (chat_id,))
         rows = [(r[0], r[1] or 0) for r in c.fetchall() if r[0]]
         conn.close()
         if not rows:
@@ -4347,11 +4539,18 @@ class SoccerBotV2:
 
     def get_nonvoters(self, poll_id: int):
         """UX-3: members who have NOT cast any vote (IN or OUT) on this poll.
+        Roster is scoped to the poll's group (NULL chat_id = legacy global fallback).
         Returns list of (username, is_display_name)."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
+        c.execute("SELECT chat_id FROM quickpolls WHERE id = ?", (poll_id,))
+        prow = c.fetchone()
+        poll_chat = prow[0] if prow else None
         try:
-            c.execute("SELECT username, is_display_name FROM members")
+            if poll_chat is not None:
+                c.execute("SELECT username, is_display_name FROM members WHERE chat_id = ? OR chat_id IS NULL", (poll_chat,))
+            else:
+                c.execute("SELECT username, is_display_name FROM members")
             members = [(r[0], r[1] or 0) for r in c.fetchall() if r[0]]
         except sqlite3.OperationalError:
             members = []
@@ -4406,7 +4605,8 @@ class SoccerBotV2:
 
     async def nudge_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Admin command: fire a non-voter nudge immediately. /nudge [poll_id]
-        — with no arg, targets the admin's most recent poll. No usage limit."""
+        — with no arg, prompts for the group (if more than one) then targets its
+        most recent poll. No usage limit."""
         user = update.effective_user
         if context.args:
             try:
@@ -4424,21 +4624,27 @@ class SoccerBotV2:
             if not row:
                 await self.send(update, "❌ No poll with that ID in a group you manage.")
                 return
-            chat_id = row[0]
-        else:
-            poll = self.latest_poll_for_admin(user.id)
-            if not poll:
-                await self.send(update, "❌ No recent poll found to nudge.")
-                return
-            poll_id, chat_id = poll[0], poll[1]
+            await self._run_nudge(update, poll_id, row[0])
+            return
+        await self._resolve_group(update, 'nudge', {}, require_poll=True, open_only=False)
 
+    async def _do_nudge(self, update: Update, payload: dict, chat_id: int):
+        """Nudge non-voters on the latest poll in the resolved group."""
+        poll = self._latest_poll_in_chat(chat_id)
+        if not poll:
+            await self.send(update, "❌ No recent poll found to nudge.")
+            return
+        await self._run_nudge(update, poll[0], chat_id)
+
+    async def _run_nudge(self, update: Update, poll_id: int, chat_id: int):
+        """Shared nudge execution + result message for both /nudge paths."""
         count = await self.nudge_nonvoters(poll_id, chat_id, respect_closed=False)
         if count:
             await self.send(update, f"✅ Nudged {count} non-voter(s) in the group.")
         else:
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM members")
+            c.execute("SELECT COUNT(*) FROM members WHERE chat_id = ? OR chat_id IS NULL", (chat_id,))
             has_members = c.fetchone()[0] > 0
             conn.close()
             if has_members:
@@ -4478,13 +4684,20 @@ class SoccerBotV2:
         """Admin override: force-add a player IN to the latest poll, even after
         it closes. Charges $10 like a normal vote; if the wallet can't cover it,
         the player is added anyway and the super-admin is notified."""
-        user = update.effective_user
         if not context.args:
             await self.send(update, "Usage: /addplayer @username [reason]")
             return
         target = context.args[0].lstrip('@')
         reason = ' '.join(context.args[1:]).strip()
-        poll = self.latest_poll_for_admin(user.id)
+        await self._resolve_group(update, 'addplayer', {'target': target, 'reason': reason},
+                                  require_poll=True, open_only=False)
+
+    async def _do_addplayer(self, update: Update, payload: dict, chat_id: int):
+        """Force-add a player IN to the latest poll in the resolved group."""
+        user = update.effective_user
+        target = payload['target']
+        reason = payload['reason']
+        poll = self._latest_poll_in_chat(chat_id)
         if not poll:
             await self.send(update, "❌ No recent poll found to adjust.")
             return
@@ -4520,12 +4733,17 @@ class SoccerBotV2:
     async def removeplayer_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Admin override: force-remove a player from the latest poll, even
         after it closes. Refunds the $10 if they had been charged."""
-        user = update.effective_user
         if not context.args:
             await self.send(update, "Usage: /removeplayer @username [reason]")
             return
         target = context.args[0].lstrip('@')
-        poll = self.latest_poll_for_admin(user.id)
+        await self._resolve_group(update, 'removeplayer', {'target': target},
+                                  require_poll=True, open_only=False)
+
+    async def _do_removeplayer(self, update: Update, payload: dict, chat_id: int):
+        """Force-remove a player from the latest poll in the resolved group."""
+        target = payload['target']
+        poll = self._latest_poll_in_chat(chat_id)
         if not poll:
             await self.send(update, "❌ No recent poll found to adjust.")
             return

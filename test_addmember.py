@@ -65,6 +65,13 @@ def seed_vote(poll_id, username, uid):
               (poll_id, uid, username))
     conn.commit(); conn.close()
 
+def seed_group(chat_id, user_id, name='Tuesday'):
+    conn = sqlite3.connect(botmod.DB_FILE); c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO chat_groups (chat_id, group_name) VALUES (?, ?)", (chat_id, name))
+    c.execute("INSERT OR IGNORE INTO chat_admins (chat_id, user_id, username) VALUES (?, ?, 'admin')",
+              (chat_id, user_id))
+    conn.commit(); conn.close()
+
 async def main():
     # F1: a fresh init_database must NOT drop the members table anymore.
     b = botmod.SoccerBotV2(token='x')
@@ -72,15 +79,18 @@ async def main():
     check('F1 members table survives init', members_in_db() is not None,
           'init_database still drops members — fix line ~508')
 
+    # The roster commands now resolve through the admin's registered group.
+    seed_group(-555, user_id=1)
+
     # A1: addmember adds, strips @, is case-insensitive on dupes
-    await b.addmember_cmd(make_update(), make_ctx('@Alice', 'bob'))
+    await b.addmember_cmd(make_update(), make_ctx('@Alice,', 'bob'))
     check('A1 added two', members_in_db() == ['Alice', 'bob'], str(members_in_db()))
 
     # A2: re-adding (different case) does not duplicate
     fbot.sent.clear()
-    await b.addmember_cmd(make_update(), make_ctx('alice', 'Carol'))
+    await b.addmember_cmd(make_update(), make_ctx('alice,', '@Carol'))
     check('A2 no dup, adds new', sorted([m.lower() for m in members_in_db()]) == ['alice', 'bob', 'carol'])
-    check('A2 reports existing', 'Already on the roster' in fbot.sent[-1]['text'])
+    check('A2 reports existing', 'Already on roster' in fbot.sent[-1]['text'])
 
     # A3: no args -> usage
     fbot.sent.clear()
@@ -89,9 +99,9 @@ async def main():
 
     # R1: removemember removes present, reports missing
     fbot.sent.clear()
-    await b.removemember_cmd(make_update(), make_ctx('@bob', 'ghost'))
+    await b.removemember_cmd(make_update(), make_ctx('@bob,', 'ghost'))
     check('R1 bob removed', 'bob' not in [m.lower() for m in members_in_db()])
-    check('R1 reports missing', 'Not on the roster' in fbot.sent[-1]['text'])
+    check('R1 reports missing', 'Not on roster' in fbot.sent[-1]['text'])
 
     # M1: members lists current roster
     fbot.sent.clear()

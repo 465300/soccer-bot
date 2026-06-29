@@ -100,6 +100,12 @@ def seed_admin(chat_id, user_id):
               (chat_id, user_id, 'admin'))
     conn.commit(); conn.close()
 
+def seed_group(chat_id, name='Tuesday'):
+    conn = sqlite3.connect(botmod.DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO chat_groups (chat_id, group_name) VALUES (?, ?)", (chat_id, name))
+    conn.commit(); conn.close()
+
 def count_events(event_type='nudge_nonvoters', executed=None):
     conn = sqlite3.connect(botmod.DB_FILE)
     c = conn.cursor()
@@ -159,7 +165,7 @@ def t_nonvoters():
     seed_vote(1, 'alice', 'in')
     seed_vote(1, 'bob', 'out')
     nv = set(b.get_nonvoters(1))
-    check('T4 nonvoters = carol,dave', nv == {'carol', 'dave'}, f"got {nv}")
+    check('T4 nonvoters = carol,dave', nv == {('carol', 0), ('dave', 0)}, f"got {nv}")
 
     # T5 case-insensitive
     reset_db(); b, _ = new_bot()
@@ -167,7 +173,7 @@ def t_nonvoters():
     seed_poll(1, -100)
     seed_vote(1, 'alice', 'in')   # lowercase vote vs capitalized member
     nv = set(b.get_nonvoters(1))
-    check('T5 case-insensitive match', nv == {'Bob'}, f"got {nv}")
+    check('T5 case-insensitive match', nv == {('Bob', 0)}, f"got {nv}")
 
     # T6 no members
     reset_db(); b, _ = new_bot()
@@ -252,7 +258,7 @@ async def t_nudge_dispatch():
 async def t_nudge_cmd():
     # T15 no args, latest poll, open -> group msg + admin "Nudged N"
     reset_db(); b, fbot = new_bot()
-    seed_members('alice', 'bob'); seed_admin(-100, 500); seed_poll(1, -100, closed=0)
+    seed_members('alice', 'bob'); seed_admin(-100, 500); seed_group(-100); seed_poll(1, -100, closed=0)
     seed_vote(1, 'alice', 'in')
     await b.nudge_cmd(make_update(500), make_ctx())
     group_msgs = [m for m in fbot.sent if m['chat_id'] == -100]
@@ -264,7 +270,7 @@ async def t_nudge_cmd():
     # T16 no args, no poll for admin
     reset_db(); b, fbot = new_bot()
     await b.nudge_cmd(make_update(500), make_ctx())
-    check('T16 no poll -> error DM', fbot.sent and 'No recent poll' in fbot.sent[-1]['text'],
+    check('T16 no poll -> error DM', fbot.sent and 'No poll found in any group' in fbot.sent[-1]['text'],
           fbot.sent[-1]['text'] if fbot.sent else 'none')
 
     # T17 explicit poll_id admin manages
@@ -290,7 +296,7 @@ async def t_nudge_cmd():
 
     # T20 everyone voted -> "already voted"
     reset_db(); b, fbot = new_bot()
-    seed_members('alice'); seed_admin(-100, 500); seed_poll(1, -100, closed=0)
+    seed_members('alice'); seed_admin(-100, 500); seed_group(-100); seed_poll(1, -100, closed=0)
     seed_vote(1, 'alice', 'in')
     await b.nudge_cmd(make_update(500), make_ctx())
     check('T20 everyone voted message', fbot.sent and 'already voted' in fbot.sent[-1]['text'],
@@ -298,7 +304,7 @@ async def t_nudge_cmd():
 
     # T21 no members -> "No members on file"
     reset_db(); b, fbot = new_bot()
-    seed_admin(-100, 500); seed_poll(1, -100, closed=0)
+    seed_admin(-100, 500); seed_group(-100); seed_poll(1, -100, closed=0)
     await b.nudge_cmd(make_update(500), make_ctx())
     check('T21 no members message', fbot.sent and 'No members on file' in fbot.sent[-1]['text'],
           fbot.sent[-1]['text'] if fbot.sent else 'none')
