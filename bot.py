@@ -114,6 +114,7 @@ class SoccerBotV2:
         self._pending_guest_add: dict[int, dict] = {}  # user_id -> {poll_id}
         self._pending_guest_remove: dict[int, dict] = {}  # user_id -> {poll_id, guests: [(id, name), ...]}
         self._cqpg_pending: dict[int, tuple] = {}  # user_id -> (poll_id, chat_id, group_name) from group picker
+        self._pending_pollreport: dict[int, dict] = {}  # user_id -> {chat_id, group_name} waiting for date input
         self.init_database()
 
     async def send(self, update: Update, text: str, **kwargs):
@@ -1989,7 +1990,9 @@ class SoccerBotV2:
             parts = query.data.split(':')  # cqpg:{chat_id}:{poll_id}
             await self.handle_cancelqp_group_callback(query, parts[1], parts[2])
             return
-        # Top-up approval (super-admin taps Approve/Reject on pending top-up DM)
+        if query.data.startswith('prpt_group:'):
+            await self.handle_pollreport_group_callback(query, query.data.split(':', 1)[1])
+            return
         if query.data.startswith('tapprove:'):
             await self.topup_approve(query, int(query.data.split(':', 1)[1]))
             return
@@ -3585,6 +3588,10 @@ class SoccerBotV2:
         """Handle admin's response to late arrivals prompt — also handles UX-4 guest name/number replies."""
         user_id = update.effective_user.id
 
+        # Poll report date input
+        if user_id in self._pending_pollreport:
+            await self._handle_pollreport_date_input(update, context)
+            return
         # UX-4: guest add state
         if user_id in self._pending_guest_add:
             await self._handle_guest_add_reply(update, context)
