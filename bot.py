@@ -1639,16 +1639,10 @@ class SoccerBotV2:
         c.execute("""SELECT username, vote_type, user_id FROM quickpoll_votes
                      WHERE poll_id = ? ORDER BY voted_at ASC, id ASC""", (poll_id,))
         rows = c.fetchall()
-        c.execute("""SELECT member_username, guest_name FROM quickpoll_guests
+        c.execute("""SELECT member_username, guest_name, confirmed FROM quickpoll_guests
                      WHERE poll_id = ? ORDER BY added_at ASC""", (poll_id,))
         guest_rows = c.fetchall()
         conn.close()
-
-        # Build inviter → [guest_name, ...] map (order-preserving)
-        inviter_guests: dict = {}
-        for mu, gname in guest_rows:
-            inviter_guests.setdefault(mu.lower() if mu else '', []).append(gname)
-        total_guests = len(guest_rows)
 
         # Closed = explicit flag OR deadline already passed (so the card flips
         # to the closed banner even before the scheduled close event fires)
@@ -1663,6 +1657,19 @@ class SoccerBotV2:
                         closed = True
                 except (ValueError, TypeError):
                     pass
+
+        # On a closed poll only show guests that were confirmed (1) or spot-held pending
+        # payment (2). Waitlisted guests (0) were not awarded a spot and must not appear.
+        if closed:
+            visible_guests = [(mu, gn) for mu, gn, conf in guest_rows if conf in (1, 2)]
+        else:
+            visible_guests = [(mu, gn) for mu, gn, conf in guest_rows]
+
+        # Build inviter → [guest_name, ...] map (order-preserving)
+        inviter_guests: dict = {}
+        for mu, gname in visible_guests:
+            inviter_guests.setdefault(mu.lower() if mu else '', []).append(gname)
+        total_guests = len(visible_guests)
 
         ins = [(u, uid) for (u, vt, uid) in rows if vt == 'in']
         outs = [(u, uid) for (u, vt, uid) in rows if vt == 'out']
