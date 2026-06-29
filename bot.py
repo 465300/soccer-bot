@@ -1549,45 +1549,94 @@ class SoccerBotV2:
             parse_mode='Markdown')
 
     async def pollreport_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Generate a CSV of closed quickpolls for a date range or month.
-        Usage:
-          /pollreport 2026-05              → full month
-          /pollreport 2026-05-01 2026-06-30  → custom range
-        """
+        """Show inline group picker, then accept a date range and deliver a CSV report."""
         user = update.effective_user
         if not (self.is_super_admin(user.id) or self.is_admin_any_chat(user.id, user.username)):
             await self.send(update, "❌ Admin only.")
             return
 
-        args = context.args
-        start_date = end_date = None
-        USAGE = "Usage:\n`/pollreport 2026-05`  → full month\n`/pollreport 2026-05-01 2026-06-30`  → custom range"
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""SELECT cg.chat_id, cg.group_name
+                     FROM chat_groups cg
+                     JOIN chat_admins ca ON cg.chat_id = ca.chat_id
+                     WHERE ca.user_id = ?
+                     ORDER BY cg.group_name""", (user.id,))
+        groups = c.fetchall()
+        conn.close()
 
-        if len(args) == 1:
-            try:
-                dt = datetime.strptime(args[0], "%Y-%m")
-                start_date = dt.replace(day=1)
-                if dt.month == 12:
-                    end_date = dt.replace(day=31)
-                else:
-                    end_date = dt.replace(month=dt.month + 1, day=1) - timedelta(days=1)
-            except ValueError:
-                await self.send(update, USAGE, parse_mode='Markdown')
-                return
-        elif len(args) == 2:
-            try:
-                start_date = datetime.strptime(args[0], "%Y-%m-%d")
-                end_date = datetime.strptime(args[1], "%Y-%m-%d")
-            except ValueError:
-                await self.send(update, USAGE, parse_mode='Markdown')
-                return
-        else:
-            await self.send(update, USAGE, parse_mode='Markdown')
+        if not groups:
+            await self.send(update, "❌ No groups found. You must be an admin of a registered group.")
             return
 
-        chat_id, group_name = self.get_admin_target_chat(user.id)
-        if not chat_id:
-            await self.send(update, "❌ No active group selected. Run /switchgroup to choose one first.")
+        if len(groups) == 1:
+            chat_id, group_name = groups[0]
+            self._pending_pollreport[user.id] = {'chat_id': chat_id, 'group_name': group_name}
+            await self.send(update,
+                f"📊 *Poll Report — {group_name}*\n\n"
+                "Enter date range:\n"
+                "• `2026-05` → full month\n"
+                "• `2026-05-01 2026-06-30` → custom range",
+                parse_mode='Markdown')
+        else:
+            buttons = [[InlineKeyboardButton(name, callback_data=f"prpt_group:{cid}")]
+                       for cid, name in groups]
+            await self.send(update, "📊 *Poll Report — Select a group:*",
+                            parse_mode='Markdown',
+                            reply_markup=InlineKeyboardMarkup(buttons))
+
+    async def handle_pollreport_group_callback(self, query, chat_id_str: str):
+        """Admin tapped a group button on the poll report group picker."""
+        await query.answer()
+        chat_id = int(chat_id_str)
+        user_id = query.from_user.id
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT group_name FROM chat_groups WHERE chat_id = ?", (chat_id,))
+        row = c.fetchone()
+        conn.close()
+        group_name = row[0] if row else str(chat_id)
+        self._pending_pollreport[user_id] = {'chat_id': chat_id, 'group_name': group_name}
+        await query.edit_message_text(
+            f"📊 *Poll Report — {group_name}*\n\n"
+            "Enter date range:\n"
+            "• `2026-05` → full month\n"
+            "• `2026-05-01 2026-06-30` → custom range",
+            parse_mode='Markdown')
+
+    async def _handle_pollreport_date_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Process the date range text the admin typed after selecting a group."""
+        user_id = update.effective_user.id
+        pending = self._pending_pollreport.pop(user_id, None)
+        if not pending:
+            return
+        grp_chat_id = pending['chat_id']
+        group_name = pending['group_name']
+        parts = update.message.text.strip().split()
+        start_date = end_date = None
+        USAGE = "Format: `2026-05` for a full month, or `2026-05-01 2026-06-30` for a custom range."
+
+        if len(parts) == 1:
+            try:
+                dt = datetime.strptime(parts[0], "%Y-%m")
+                start_date = dt.replace(day=1)
+                end_date = (dt.replace(day=31) if dt.month == 12
+                            else dt.replace(month=dt.month + 1, day=1) - timedelta(days=1))
+            except ValueError:
+                self._pending_pollreport[user_id] = pending
+                await self.send(update, f"❌ Couldn't parse that. {USAGE}", parse_mode='Markdown')
+                return
+        elif len(parts) == 2:
+            try:
+                start_date = datetime.strptime(parts[0], "%Y-%m-%d")
+                end_date = datetime.strptime(parts[1], "%Y-%m-%d")
+            except ValueError:
+                self._pending_pollreport[user_id] = pending
+                await self.send(update, f"❌ Couldn't parse that. {USAGE}", parse_mode='Markdown')
+                return
+        else:
+            self._pending_pollreport[user_id] = pending
+            await self.send(update, f"❌ Unexpected format. {USAGE}", parse_mode='Markdown')
             return
 
         conn = sqlite3.connect(DB_FILE)
@@ -1597,8 +1646,8 @@ class SoccerBotV2:
                             COUNT(CASE WHEN v.vote_type='out' THEN 1 END) as out_count
                      FROM quickpolls q
                      LEFT JOIN quickpoll_votes v ON v.poll_id = q.id
-                     WHERE q.chat_id = ?
-                     GROUP BY q.id""", (chat_id,))
+                     WHERE q.closed = 1 AND q.chat_id = ?
+                     GROUP BY q.id""", (grp_chat_id,))
         rows = c.fetchall()
 
         DATE_FORMATS = ["%Y-%m-%d", "%m/%d/%Y", "%m/%d", "%b %d", "%B %d", "%B %d, %Y"]
@@ -1619,11 +1668,8 @@ class SoccerBotV2:
         results = []
         for poll_id, game_date_raw, location, max_players, field_rate, in_count, out_count in rows:
             d = parse_game_date(game_date_raw)
-            if not d:
+            if not d or not (start_date <= d <= end_date):
                 continue
-            if not (start_date <= d <= end_date):
-                continue
-
             gc_count = c.execute("""SELECT COUNT(*) FROM quickpoll_guests
                                     WHERE poll_id = ? AND confirmed IN (1, 2)""",
                                  (poll_id,)).fetchone()[0]
@@ -1634,7 +1680,6 @@ class SoccerBotV2:
             rate_pct = f"{round(in_count / max_players * 100)}%" if max_players and in_count else ""
             total_units = in_count + gc_count
             per_player = f"${field_rate / total_units:.2f}" if field_rate and total_units else ""
-
             results.append({
                 "game_date": d.strftime("%Y-%m-%d"),
                 "location": location or "",
@@ -1649,11 +1694,10 @@ class SoccerBotV2:
         conn.close()
 
         if not results:
-            await self.send(update, "No closed polls found for that period.")
+            await self.send(update, f"No closed polls found for {group_name} in that period.")
             return
 
         results.sort(key=lambda r: r["game_date"])
-
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=["game_date", "location", "total_in", "total_out",
                                                   "total_guests", "participation_rate",
@@ -1661,13 +1705,12 @@ class SoccerBotV2:
         writer.writeheader()
         writer.writerows(results)
         csv_bytes = buf.getvalue().encode('utf-8')
-
-        label = args[0].replace('-', '_') if len(args) == 1 else f"{args[0]}_to_{args[1]}"
-        filename = f"poll_report_{label}.csv"
+        range_label = parts[0].replace('-', '_') if len(parts) == 1 else f"{parts[0]}_to_{parts[1]}"
+        filename = f"poll_report_{group_name}_{range_label}.csv"
         await update.message.reply_document(
             document=io.BytesIO(csv_bytes),
             filename=filename,
-            caption=f"📊 {len(results)} game{'s' if len(results) != 1 else ''} — {start_date.strftime('%b %d')} to {end_date.strftime('%b %d, %Y')}"
+            caption=f"📊 {group_name} — {len(results)} game{'s' if len(results) != 1 else ''} — {start_date.strftime('%b %d')} to {end_date.strftime('%b %d, %Y')}"
         )
 
     async def initchats_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
