@@ -1584,6 +1584,11 @@ class SoccerBotV2:
             await self.send(update, USAGE, parse_mode='Markdown')
             return
 
+        chat_id, group_name = self.get_admin_target_chat(user.id)
+        if not chat_id:
+            await self.send(update, "❌ No active group selected. Run /switchgroup to choose one first.")
+            return
+
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("""SELECT q.id, q.game_date, q.location_name, q.max_players, q.field_rate,
@@ -1591,8 +1596,8 @@ class SoccerBotV2:
                             COUNT(CASE WHEN v.vote_type='out' THEN 1 END) as out_count
                      FROM quickpolls q
                      LEFT JOIN quickpoll_votes v ON v.poll_id = q.id
-                     WHERE q.closed = 1
-                     GROUP BY q.id""")
+                     WHERE q.chat_id = ?
+                     GROUP BY q.id""", (chat_id,))
         rows = c.fetchall()
 
         DATE_FORMATS = ["%Y-%m-%d", "%m/%d/%Y", "%m/%d", "%b %d", "%B %d", "%B %d, %Y"]
