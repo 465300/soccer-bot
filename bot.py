@@ -1091,7 +1091,7 @@ class SoccerBotV2:
             try:
                 await self.application.bot.send_message(
                     chat_id=SUPER_ADMIN_ID,
-                    text=f"💰 @{username} wants to top up *${amount:.2f}*.\nApprove to credit their wallet.",
+                    text=f"💰 `{username}` wants to top up *${amount:.2f}*.\nApprove to credit their wallet.",
                     reply_markup=kb,
                     parse_mode='Markdown')
             except Exception as e:
@@ -1506,7 +1506,7 @@ class SoccerBotV2:
         if not history:
             await self.send(update, f"No payment history for `{raw_username}`.", parse_mode='Markdown')
             return
-        lines = [f"💳 *Wallet history — {raw_username}*", f"Current balance: *${wallet['balance']:.2f}*\n"]
+        lines = [f"💳 *Wallet history* — `{raw_username}`", f"Current balance: *${wallet['balance']:.2f}*\n"]
         for h in history:
             amt = h['amount']
             sign = "+" if amt >= 0 else "−"
@@ -1573,7 +1573,7 @@ class SoccerBotV2:
             chat_id, group_name = groups[0]
             self._pending_pollreport[user.id] = {'chat_id': chat_id, 'group_name': group_name}
             await self.send(update,
-                f"📊 *Poll Report — {group_name}*\n\n"
+                f"📊 *Poll Report* — `{group_name}`\n\n"
                 "Enter date range:\n"
                 "• `2026-05` → full month\n"
                 "• `2026-05-01 2026-06-30` → custom range",
@@ -1598,7 +1598,7 @@ class SoccerBotV2:
         group_name = row[0] if row else str(chat_id)
         self._pending_pollreport[user_id] = {'chat_id': chat_id, 'group_name': group_name}
         await query.edit_message_text(
-            f"📊 *Poll Report — {group_name}*\n\n"
+            f"📊 *Poll Report* — `{group_name}`\n\n"
             "Enter date range:\n"
             "• `2026-05` → full month\n"
             "• `2026-05-01 2026-06-30` → custom range",
@@ -2638,7 +2638,7 @@ class SoccerBotV2:
         lines = []
         for cid, name in groups:
             marker = "✅" if cid == active_chat_id else "•"
-            lines.append(f"{marker} *{name}*")
+            lines.append(f"{marker} `{name}`")
         text = "📋 *Your groups:*\n\n" + "\n".join(lines)
         if len(groups) > 1:
             text += "\n\n/switchgroup to change target"
@@ -2770,9 +2770,9 @@ class SoccerBotV2:
 
         text = "*🔐 Admins:*\n"
         for uid, username, added_by in admins:
-            label = (username or '').replace('_', '\\_') or '(no username)'
+            label = username or '(no username)'
             suffix = f" (ID: {uid})" if uid and uid != 0 else ""
-            text += f"• {label}{suffix}\n"
+            text += f"• `{label}`{suffix}\n"
 
         await self.send(update, text, parse_mode='Markdown')
 
@@ -4156,7 +4156,7 @@ class SoccerBotV2:
             f"*Player added:* @{safe_target}\n"
             f"*Game:* poll #{poll_id}\n"
             f"*When:* {when}\n"
-            f"*Reason:* {reason or '—'}\n"
+            f"*Reason:* `{reason or '—'}`\n"
             f"*Wallet:* {wstate}\n\n"
             f"⚠️ ${VOTE_COST:.0f} was *not* charged (insufficient balance). Player added to the roster anyway."
         )
@@ -4585,7 +4585,7 @@ class SoccerBotV2:
             context.user_data['cancel_qp_chat_id'] = chat_id
             date_str = self._pretty_date(game_date) if game_date else 'TBD'
             time_str = f" · {time_start}" if time_start else ""
-            await self.send(update, f"Cancelling poll in *{group_name}*:\n📍 {location} — {date_str}{time_str}\n\nWhat's the reason? Send it or /skip.", parse_mode='Markdown')
+            await self.send(update, f"Cancelling poll in `{group_name}`:\n📍 `{location}` — {date_str}{time_str}\n\nWhat's the reason? Send it or /skip.", parse_mode='Markdown')
             return CANCEL_QP_REASON
 
         # Multiple groups — show inline group picker with poll details
@@ -4645,13 +4645,13 @@ class SoccerBotV2:
         if prow:
             date_str = self._pretty_date(prow[1]) if prow[1] else 'TBD'
             time_str = f" · {prow[2]}" if prow[2] else ""
-            poll_detail = f"\n📍 {prow[0]} — {date_str}{time_str}"
+            poll_detail = f"\n📍 `{prow[0]}` — {date_str}{time_str}"
         else:
             poll_detail = ""
         self._cqpg_pending[query.from_user.id] = (poll_id, chat_id, group_name)
         await query.answer()
         await query.edit_message_text(
-            f"Cancelling poll in *{group_name}*{poll_detail}\n\nWhat's the reason? Reply here or /skip.",
+            f"Cancelling poll in `{group_name}`{poll_detail}\n\nWhat's the reason? Reply here or /skip.",
             parse_mode='Markdown')
 
     async def cancel_qp_reason(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
