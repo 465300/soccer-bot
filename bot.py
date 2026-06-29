@@ -93,7 +93,7 @@ ADMIN_COMMANDS = {
     'sendvenmolink', 'waive', 'initchats',
     'addplayer', 'removeplayer', 'nudge',
     'addmember', 'removemember', 'members',
-    'pollreport',
+    'pollreport', 'setfieldrate',
     # Admins get everything except the money commands below.
     'addadmin', 'removeadmin', 'listadmins', 'wallethistory',
     'switchgroup', 'mygroups',
@@ -115,6 +115,7 @@ class SoccerBotV2:
         self._pending_guest_remove: dict[int, dict] = {}  # user_id -> {poll_id, guests: [(id, name), ...]}
         self._cqpg_pending: dict[int, tuple] = {}  # user_id -> (poll_id, chat_id, group_name) from group picker
         self._pending_pollreport: dict[int, dict] = {}  # user_id -> {chat_id, group_name} waiting for date input
+        self._setfieldrate_pending: dict[int, dict] = {}  # user_id -> {stage, chat_id, group_name, poll_id} for /setfieldrate flow
         self.init_database()
 
     async def send(self, update: Update, text: str, **kwargs):
@@ -272,6 +273,7 @@ class SoccerBotV2:
             BotCommand('listadmins', 'See all admins for a group'),
             BotCommand('wallethistory', 'Full transaction history for a player — /wallethistory @user'),
             BotCommand('pollreport', 'Game attendance CSV — /pollreport 2026-05 or /pollreport 2026-05-01 2026-06-30'),
+            BotCommand('setfieldrate', 'Set/fix the field cost for a game — charges each player their share'),
         ]
         super_cmds = [
             BotCommand('voidpayment', 'Reverse a payment — /voidpayment <id>'),
@@ -635,6 +637,17 @@ class SoccerBotV2:
         c.execute('''CREATE TABLE IF NOT EXISTS admin_active_chat (
             user_id INTEGER PRIMARY KEY,
             chat_id INTEGER)''')
+        # Field-rate change history — audit log of every field_rate set/edit on a poll.
+        # Records only field-rate changes (not money). Money trail lives in payment_confirmations.
+        c.execute('''CREATE TABLE IF NOT EXISTS field_rate_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            poll_id INTEGER NOT NULL,
+            changed_by_user_id INTEGER,
+            changed_by_username TEXT,
+            old_rate REAL,
+            new_rate REAL,
+            reason TEXT,
+            changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
         # UX-4: guest (+1) system — inviter brings named guest(s) to a quickpoll
         # confirmed: 0=waitlisted, 1=confirmed+charged, 2=pending_payment (inviter short)
         c.execute('''CREATE TABLE IF NOT EXISTS quickpoll_guests (
@@ -2036,6 +2049,15 @@ class SoccerBotV2:
         if query.data.startswith('prpt_group:'):
             await self.handle_pollreport_group_callback(query, query.data.split(':', 1)[1])
             return
+        if query.data.startswith('sfr_group:'):
+            await self.handle_setfieldrate_group_callback(query, query.data.split(':', 1)[1])
+            return
+        if query.data == 'sfr_older':
+            await self.handle_setfieldrate_older_callback(query)
+            return
+        if query.data.startswith('sfr_poll:'):
+            await self.handle_setfieldrate_poll_callback(query, query.data.split(':', 1)[1])
+            return
         if query.data.startswith('tapprove:'):
             await self.topup_approve(query, int(query.data.split(':', 1)[1]))
             return
@@ -2485,106 +2507,384 @@ class SoccerBotV2:
             uc.close()
             spots_used += 1
 
-        # --- Step 2: Charge all IN players ---
-        if not field_rate:
+        # --- Step 2: Charge all IN players (Path B) ---
+        # Net-delta reconciliation, shared with /setfieldrate so close-time and
+        # later rate edits can never drift apart.
+        await self._apply_field_charges(poll_id)
+
+    def log_field_rate_change(self, poll_id: int, user, old_rate, new_rate, reason: str = None):
+        """Append a row to field_rate_history. Records ONLY field-rate changes
+        (who/when/old/new/why) — never moves money. Money lives in payment_confirmations."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""INSERT INTO field_rate_history
+                     (poll_id, changed_by_user_id, changed_by_username, old_rate, new_rate, reason)
+                     VALUES (?, ?, ?, ?, ?, ?)""",
+                  (poll_id,
+                   getattr(user, 'id', None) if user else None,
+                   getattr(user, 'username', None) if user else None,
+                   old_rate, new_rate, reason))
+        conn.commit()
+        conn.close()
+
+    async def _dm_field_charge(self, user_id, game_label, share, deducted, new_balance, guest_count):
+        if not user_id:
+            return
+        guest_note = f" (you + {guest_count} guest{'s' if guest_count > 1 else ''})" if guest_count else ""
+        try:
+            await self.application.bot.send_message(
+                chat_id=user_id,
+                text=(f"⚽ Your share for {game_label}{guest_note} is ${share:.2f}.\n"
+                      f"${deducted:.2f} was deducted from your wallet.\n"
+                      f"💰 Wallet balance: ${new_balance:.2f}"))
+        except Exception as e:
+            logger.warning(f"Could not DM field charge to {user_id}: {e}")
+
+    async def _dm_field_refund(self, user_id, game_label, share, refunded, new_balance):
+        if not user_id:
+            return
+        try:
+            await self.application.bot.send_message(
+                chat_id=user_id,
+                text=(f"⚽ Your share for {game_label} was updated to ${share:.2f}.\n"
+                      f"${refunded:.2f} was refunded to your wallet.\n"
+                      f"💰 Wallet balance: ${new_balance:.2f}"))
+        except Exception as e:
+            logger.warning(f"Could not DM field refund to {user_id}: {e}")
+
+    async def _apply_field_charges(self, poll_id: int):
+        """Net-delta reconcile each IN player's wallet to their fair share of the
+        field cost. Idempotent: moves only the difference between what a player
+        SHOULD pay (field_rate / total_units, ×guests) and what they have already
+        paid for this poll. Safe at close (first charge) AND on later /setfieldrate
+        edits (charges or refunds the difference). DMs each affected player their
+        share + new balance, plus a super-admin summary."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT field_rate, location_name, game_date FROM quickpolls WHERE id = ?", (poll_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return
+        field_rate, location, game_date = row
+        c.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND confirmed IN (1, 2)", (poll_id,))
+        total_confirmed_guests = c.fetchone()[0]
+        c.execute("SELECT username, user_id FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
+        in_voters = c.fetchall()
+        conn.close()
+
+        if not field_rate or field_rate <= 0:
             if SUPER_ADMIN_ID:
                 try:
                     await self.application.bot.send_message(
                         chat_id=SUPER_ADMIN_ID,
-                        text=f"ℹ️ Poll #{poll_id} closed — no field rate was set, so no charges were made.")
+                        text=f"ℹ️ Poll #{poll_id}: no field rate set, so no charges were made.")
                 except Exception:
                     pass
             return
-
-        gc = sqlite3.connect(DB_FILE)
-        gcc = gc.cursor()
-        gcc.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND confirmed IN (1, 2)", (poll_id,))
-        total_confirmed_guests = gcc.fetchone()[0]
-        gcc.execute("SELECT username, user_id FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
-        in_voters = gcc.fetchall()
-        gc.close()
 
         total_units = len(in_voters) + total_confirmed_guests
         if total_units == 0:
             return
         per_unit = round(field_rate / total_units, 2)
 
-        charged_ok = []
-        shortfalls = []
+        game_label = location or f"poll #{poll_id}"
+        if game_date:
+            pretty = self._pretty_date(game_date)
+            if pretty:
+                game_label = f"{location} ({pretty})" if location else pretty
+
+        charged, refunded, shortfalls = [], [], []
 
         for voter_username, voter_user_id in in_voters:
-            # Waiver holders pay nothing at close
             wc = sqlite3.connect(DB_FILE)
             wcc = wc.cursor()
+            # Waiver holders pay nothing
             wcc.execute("""SELECT 1 FROM payment_confirmations
                            WHERE LOWER(username) = LOWER(?) AND notes LIKE ? AND status = 'waived'""",
                         (voter_username, f"waiver:#{poll_id}%"))
             is_waived = wcc.fetchone() is not None
+            wcc.execute("""SELECT COUNT(*) FROM quickpoll_guests
+                           WHERE poll_id = ? AND confirmed IN (1, 2) AND LOWER(member_username) = LOWER(?)""",
+                        (poll_id, voter_username))
+            guest_count = wcc.fetchone()[0]
+            # already_paid for THIS poll = -(sum of confirmed charges/refunds tagged to it)
+            wcc.execute("""SELECT COALESCE(SUM(amount), 0) FROM payment_confirmations
+                           WHERE LOWER(username) = LOWER(?) AND status = 'confirmed'
+                             AND notes IN (?, ?)""",
+                        (voter_username, f"quickpoll_vote:{poll_id}", f"quickpoll_refund:{poll_id}"))
+            already_paid = round(-float(wcc.fetchone()[0]), 2)
             wc.close()
-            if is_waived:
+
+            target = 0.0 if is_waived else round(per_unit * (1 + guest_count), 2)
+            delta = round(target - already_paid, 2)
+
+            if abs(delta) < 0.01:
                 continue
 
-            gfc = sqlite3.connect(DB_FILE)
-            gfcc = gfc.cursor()
-            gfcc.execute("""SELECT COUNT(*) FROM quickpoll_guests
-                            WHERE poll_id = ? AND confirmed IN (1, 2) AND LOWER(member_username) = LOWER(?)""",
-                         (poll_id, voter_username))
-            guest_count = gfcc.fetchone()[0]
-            gfc.close()
-
-            amount_due = round(per_unit * (1 + guest_count), 2)
-            wallet = self.get_wallet(voter_username)
-            balance = wallet['balance'] if wallet else 0
-
-            if balance >= amount_due:
-                self.deduct_wallet(voter_username, amount_due, f"quickpoll_vote:{poll_id}")
-                charged_ok.append((voter_username, amount_due, guest_count))
+            if delta > 0:
+                ok = self.deduct_wallet(voter_username, delta, f"quickpoll_vote:{poll_id}")
+                if ok:
+                    w = self.get_wallet(voter_username)
+                    new_bal = w['balance'] if w else 0
+                    charged.append((voter_username, target, delta, guest_count, new_bal))
+                    await self._dm_field_charge(voter_user_id, game_label, target, delta, new_bal, guest_count)
+                else:
+                    w = self.get_wallet(voter_username)
+                    bal = w['balance'] if w else 0
+                    short = round(delta - bal, 2)
+                    now_iso = datetime.now(TZ).isoformat()
+                    sc = sqlite3.connect(DB_FILE)
+                    scc = sc.cursor()
+                    scc.execute("""INSERT INTO payment_confirmations
+                                   (username, amount, payment_date, confirmed_date, status, notes)
+                                   VALUES (?, ?, ?, ?, 'pending', ?)""",
+                                (voter_username, -delta, now_iso, now_iso, f"quickpoll_vote:{poll_id}:shortfall"))
+                    sc.commit()
+                    sc.close()
+                    shortfalls.append((voter_username, voter_user_id, target, delta, short, guest_count))
+                    if voter_user_id:
+                        try:
+                            await self.application.bot.send_message(
+                                chat_id=voter_user_id,
+                                text=(f"⚠️ Your share for {game_label} is ${target:.2f}, but your wallet "
+                                      f"only has ${bal:.2f}. You're short ${short:.2f} — please top up to cover it."))
+                        except Exception:
+                            pass
             else:
-                shortfall = round(amount_due - balance, 2)
-                shortfalls.append((voter_username, voter_user_id, amount_due, guest_count, shortfall))
-                now_iso = datetime.now(TZ).isoformat()
-                sc = sqlite3.connect(DB_FILE)
-                scc = sc.cursor()
-                scc.execute("""INSERT INTO payment_confirmations
-                               (username, amount, payment_date, confirmed_date, status, notes)
-                               VALUES (?, ?, ?, ?, 'pending', ?)""",
-                            (voter_username, -amount_due, now_iso, now_iso, f"quickpoll_vote:{poll_id}:shortfall"))
-                sc.commit()
-                sc.close()
+                refund = round(-delta, 2)
+                self.credit_wallet(voter_username, refund, f"quickpoll_refund:{poll_id}")
+                w = self.get_wallet(voter_username)
+                new_bal = w['balance'] if w else 0
+                refunded.append((voter_username, target, refund, guest_count, new_bal))
+                await self._dm_field_refund(voter_user_id, game_label, target, refund, new_bal)
 
-        # DM players with shortfalls
-        for voter_username, voter_user_id, amount_due, guest_count, shortfall in shortfalls:
-            if voter_user_id:
-                try:
-                    guest_note = f" (covering you + {guest_count} guest{'s' if guest_count > 1 else ''})" if guest_count else ""
-                    await self.application.bot.send_message(
-                        chat_id=voter_user_id,
-                        text=(f"⚠️ Your share for today's game was ${amount_due:.2f}{guest_note}, "
-                              f"but your wallet only has ${(amount_due - shortfall):.2f}. "
-                              f"You're short ${shortfall:.2f}. Please top up to cover the balance."))
-                except Exception as e:
-                    logger.warning(f"Could not DM shortfall notice to {voter_user_id}: {e}")
-
-        # DM super-admin summary
-        if SUPER_ADMIN_ID and (charged_ok or shortfalls):
-            lines = [f"💰 Poll #{poll_id} closed — ${per_unit:.2f}/unit ({total_units} units, ${field_rate:.2f} field):"]
-            if charged_ok:
-                lines.append(f"\n✅ Charged ({len(charged_ok)}):")
-                for u, amt, gc_count in charged_ok:
-                    g = f" +{gc_count}g" if gc_count else ""
-                    lines.append(f"  • @{u}{g}: ${amt:.2f}")
+        # Super-admin summary
+        if SUPER_ADMIN_ID and (charged or refunded or shortfalls):
+            lines = [f"💰 Poll #{poll_id} — ${per_unit:.2f}/unit ({total_units} units, ${field_rate:.2f} field):"]
+            if charged:
+                lines.append(f"\n✅ Charged ({len(charged)}):")
+                for u, tgt, d, gcount, bal in charged:
+                    g = f" +{gcount}g" if gcount else ""
+                    lines.append(f"  • @{u}{g}: ${d:.2f} (share ${tgt:.2f}, bal ${bal:.2f})")
+            if refunded:
+                lines.append(f"\n↩️ Refunded ({len(refunded)}):")
+                for u, tgt, r, gcount, bal in refunded:
+                    g = f" +{gcount}g" if gcount else ""
+                    lines.append(f"  • @{u}{g}: ${r:.2f} (share ${tgt:.2f}, bal ${bal:.2f})")
             if shortfalls:
                 lines.append(f"\n⚠️ Shortfalls ({len(shortfalls)}):")
-                for u, uid, amt, gc_count, sf in shortfalls:
-                    g = f" +{gc_count}g" if gc_count else ""
-                    lines.append(f"  • @{u}{g}: owes ${amt:.2f} (short ${sf:.2f})")
+                for u, uid, tgt, d, short, gcount in shortfalls:
+                    g = f" +{gcount}g" if gcount else ""
+                    lines.append(f"  • @{u}{g}: needs ${d:.2f} (share ${tgt:.2f}, short ${short:.2f})")
             try:
-                await self.application.bot.send_message(
-                    chat_id=SUPER_ADMIN_ID, text="\n".join(lines))
+                await self.application.bot.send_message(chat_id=SUPER_ADMIN_ID, text="\n".join(lines))
             except Exception as e:
-                logger.warning(f"Could not DM admin close summary: {e}")
+                logger.warning(f"Could not DM admin field-charge summary: {e}")
+
+    # ===== /setfieldrate — set or fix a poll's field cost =====
+    def _sfr_poll_rows(self, chat_id, start=None, end=None, limit=8):
+        """Recent polls for a group, or polls within an ISO date range."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        if start and end:
+            c.execute("""SELECT id, game_date, location_name, field_rate, closed FROM quickpolls
+                         WHERE chat_id = ? AND game_date >= ? AND game_date <= ?
+                         ORDER BY game_date DESC, id DESC LIMIT ?""",
+                      (chat_id, start, end, limit))
+        else:
+            c.execute("""SELECT id, game_date, location_name, field_rate, closed FROM quickpolls
+                         WHERE chat_id = ? ORDER BY id DESC LIMIT ?""", (chat_id, limit))
+        rows = c.fetchall()
+        conn.close()
+        return rows
+
+    def _sfr_build_picker(self, group_name, rows, include_older=True):
+        """Build the inline poll-picker keyboard for /setfieldrate."""
+        if not rows:
+            return f"💵 *{group_name}* — no polls found.", None
+        buttons = []
+        for pid, game_date, location, field_rate, closed in rows:
+            date_str = self._pretty_date(game_date) if game_date else 'TBD'
+            rate_str = f"${field_rate:.0f}" if field_rate else "unset"
+            lock = "🔒 " if closed else ""
+            label = f"{lock}{date_str} · {location} · {rate_str}"
+            buttons.append([InlineKeyboardButton(label[:60], callback_data=f"sfr_poll:{pid}")])
+        if include_older:
+            buttons.append([InlineKeyboardButton("📅 Older / search by date…", callback_data="sfr_older")])
+        return f"💵 *Set field rate* — `{group_name}`\nPick the game:", InlineKeyboardMarkup(buttons)
+
+    def _sfr_parse_and_query(self, chat_id, text):
+        """Parse a month (2026-05) or range (2026-05-01 2026-06-30) and return (rows, error)."""
+        parts = text.split()
+        USAGE = "Format: `2026-05` for a month, or `2026-05-01 2026-06-30` for a range."
+        try:
+            if len(parts) == 1:
+                dt = datetime.strptime(parts[0], "%Y-%m")
+                start = dt.replace(day=1)
+                end = (dt.replace(day=31) if dt.month == 12
+                       else dt.replace(month=dt.month + 1, day=1) - timedelta(days=1))
+            elif len(parts) == 2:
+                start = datetime.strptime(parts[0], "%Y-%m-%d")
+                end = datetime.strptime(parts[1], "%Y-%m-%d")
+            else:
+                return None, f"❌ Unexpected format. {USAGE}"
+        except ValueError:
+            return None, f"❌ Couldn't parse that. {USAGE}"
+        rows = self._sfr_poll_rows(chat_id, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), limit=25)
+        return rows, None
+
+    async def setfieldrate_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set or fix the field cost on a poll: group picker → poll picker → amount.
+        Closed polls reconcile player wallets immediately; open polls charge at close."""
+        user = update.effective_user
+        if not (self.is_super_admin(user.id) or self.is_admin_any_chat(user.id, user.username)):
+            await self.send(update, "❌ Admin only.")
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""SELECT cg.chat_id, cg.group_name FROM chat_groups cg
+                     JOIN chat_admins ca ON cg.chat_id = ca.chat_id
+                     WHERE ca.user_id = ? ORDER BY cg.group_name""", (user.id,))
+        groups = c.fetchall()
+        conn.close()
+        if not groups:
+            await self.send(update, "❌ No groups found. You must be an admin of a registered group.")
+            return
+        if len(groups) == 1:
+            chat_id, group_name = groups[0]
+            self._setfieldrate_pending[user.id] = {'stage': 'picking', 'chat_id': chat_id, 'group_name': group_name}
+            rows = self._sfr_poll_rows(chat_id)
+            text, kb = self._sfr_build_picker(group_name, rows)
+            await self.send(update, text, parse_mode='Markdown', reply_markup=kb)
+            return
+        buttons = [[InlineKeyboardButton(name, callback_data=f"sfr_group:{cid}")] for cid, name in groups]
+        await self.send(update, "💵 *Set field rate — pick a group:*", parse_mode='Markdown',
+                        reply_markup=InlineKeyboardMarkup(buttons))
+
+    async def handle_setfieldrate_group_callback(self, query, chat_id_str):
+        """Admin tapped a group on the /setfieldrate group picker."""
+        await query.answer()
+        chat_id = int(chat_id_str)
+        user_id = query.from_user.id
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT group_name FROM chat_groups WHERE chat_id = ?", (chat_id,))
+        row = c.fetchone()
+        conn.close()
+        group_name = row[0] if row else str(chat_id)
+        self._setfieldrate_pending[user_id] = {'stage': 'picking', 'chat_id': chat_id, 'group_name': group_name}
+        rows = self._sfr_poll_rows(chat_id)
+        text, kb = self._sfr_build_picker(group_name, rows)
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=kb)
+
+    async def handle_setfieldrate_older_callback(self, query):
+        """Admin tapped 'Older / search by date' — switch to date-range input."""
+        await query.answer()
+        user_id = query.from_user.id
+        pending = self._setfieldrate_pending.get(user_id)
+        if not pending:
+            await query.edit_message_text("Session expired. Run /setfieldrate again.")
+            return
+        pending['stage'] = 'await_date'
+        await query.edit_message_text(
+            "📅 Enter a month or date range to list older games:\n"
+            "• `2026-05` → full month\n"
+            "• `2026-05-01 2026-06-30` → custom range",
+            parse_mode='Markdown')
+
+    async def handle_setfieldrate_poll_callback(self, query, poll_id_str):
+        """Admin tapped a poll — prompt for the new field rate."""
+        await query.answer()
+        user_id = query.from_user.id
+        poll_id = int(poll_id_str)
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT location_name, game_date, field_rate, closed FROM quickpolls WHERE id = ?", (poll_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            await query.edit_message_text("❌ Poll not found.")
+            return
+        location, game_date, field_rate, closed = row
+        pending = self._setfieldrate_pending.get(user_id, {})
+        pending.update({'stage': 'await_amount', 'poll_id': poll_id})
+        self._setfieldrate_pending[user_id] = pending
+        date_str = self._pretty_date(game_date) if game_date else 'TBD'
+        cur = f"${field_rate:.2f}" if field_rate else "unset"
+        status = ("🔒 closed — players will be charged/refunded immediately"
+                  if closed else "open — players charged at close")
+        await query.edit_message_text(
+            f"💵 `{location}` — {date_str}\n"
+            f"Current field rate: {cur}\n_{status}_\n\n"
+            f"Reply with the amount you paid (e.g. `82`), optionally a reason:\n`82 miscounted earlier`",
+            parse_mode='Markdown')
+
+    async def _handle_setfieldrate_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Route text the admin types during the /setfieldrate flow."""
+        user_id = update.effective_user.id
+        pending = self._setfieldrate_pending.get(user_id)
+        if not pending:
+            return
+        stage = pending.get('stage')
+        text = update.message.text.strip()
+        if stage == 'await_date':
+            rows, err = self._sfr_parse_and_query(pending['chat_id'], text)
+            if err:
+                await self.send(update, err, parse_mode='Markdown')
+                return
+            if not rows:
+                await self.send(update, "No games found in that range. Try another range, or /cancel.")
+                return
+            pending['stage'] = 'picking'
+            ptext, kb = self._sfr_build_picker(pending['group_name'], rows, include_older=False)
+            await self.send(update, ptext, parse_mode='Markdown', reply_markup=kb)
+            return
+        if stage == 'await_amount':
+            parts = text.split()
+            try:
+                new_rate = float(parts[0].lstrip('$'))
+                if new_rate < 0:
+                    raise ValueError
+            except (ValueError, IndexError):
+                await self.send(update, "Enter a valid dollar amount, e.g. `82`", parse_mode='Markdown')
+                return
+            reason = ' '.join(parts[1:]).strip() or None
+            await self._apply_setfieldrate(update, pending['poll_id'], new_rate, reason)
+            self._setfieldrate_pending.pop(user_id, None)
+            return
+
+    async def _apply_setfieldrate(self, update: Update, poll_id, new_rate, reason):
+        """Persist the new field rate, audit-log it, and (if closed) reconcile wallets."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT field_rate, location_name, game_date, closed FROM quickpolls WHERE id = ?", (poll_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            await self.send(update, "❌ Poll not found.")
+            return
+        old_rate, location, game_date, closed = row
+        c.execute("UPDATE quickpolls SET field_rate = ? WHERE id = ?", (new_rate, poll_id))
+        conn.commit()
+        conn.close()
+        self.log_field_rate_change(poll_id, update.effective_user, old_rate, new_rate, reason)
+        old_str = f"${old_rate:.2f}" if old_rate is not None else "(unset)"
+        date_str = self._pretty_date(game_date) if game_date else 'TBD'
+        if closed:
+            await self.send(update,
+                f"✅ Field rate for `{location}` ({date_str}) updated: {old_str} → ${new_rate:.2f}\n"
+                f"Reconciling player wallets now…", parse_mode='Markdown')
+            await self._apply_field_charges(poll_id)
+            await self.send(update, "💸 Done — players have been charged/refunded and notified.")
+        else:
+            await self.send(update,
+                f"✅ Field rate for `{location}` ({date_str}) set: {old_str} → ${new_rate:.2f}\n"
+                f"Poll is still open — players will be charged their share at close.",
+                parse_mode='Markdown')
 
     async def switchgroup_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+
         """Show all registered groups as inline buttons; tapping one sets the active group."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -3410,7 +3710,7 @@ class SoccerBotV2:
             context.user_data['qp']['deadline_hours'] = None
             context.user_data['qp']['auto_teams'] = False
             context.user_data['qp']['num_teams'] = context.user_data['qp'].get('num_teams', 0)
-            await self.send(update, "Last step: What did you pay for the field? (e.g. 82, or *skip*):", parse_mode='Markdown')
+            await self.send(update, "Last step: What did you pay for the field? (e.g. 82) — *required*:", parse_mode='Markdown')
             return QP_FIELD_RATE
         try:
             hours = float(text)
@@ -3430,7 +3730,7 @@ class SoccerBotV2:
         elif answer in ('no', 'n'):
             context.user_data['qp']['auto_teams'] = False
             context.user_data['qp']['num_teams'] = 0
-            await self.send(update, "Last step: What did you pay for the field? (e.g. 82, or *skip*):", parse_mode='Markdown')
+            await self.send(update, "Last step: What did you pay for the field? (e.g. 82) — *required*:", parse_mode='Markdown')
             return QP_FIELD_RATE
         else:
             await self.send(update, "Please answer *yes* or *no*:")
@@ -3446,22 +3746,22 @@ class SoccerBotV2:
             return QP_NUM_TEAMS
         
         context.user_data['qp']['num_teams'] = num_teams
-        await self.send(update, "Last step: What did you pay for the field? (e.g. 82, or *skip*):", parse_mode='Markdown')
+        await self.send(update, "Last step: What did you pay for the field? (e.g. 82) — *required*:", parse_mode='Markdown')
         return QP_FIELD_RATE
 
     async def qp_get_field_rate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip().lower()
-        if text in ('skip', 'no', 'n', '0'):
-            context.user_data['qp']['field_rate'] = None
-        else:
-            try:
-                rate = float(text.lstrip('$'))
-                if rate < 0:
-                    raise ValueError
-                context.user_data['qp']['field_rate'] = rate
-            except ValueError:
-                await self.send(update, "Please enter a dollar amount (e.g. 82), or *skip*:", parse_mode='Markdown')
-                return QP_FIELD_RATE
+        if text in ('skip', 'no', 'n'):
+            await self.send(update, "⚠️ The field rate is *required* — please enter the amount you paid for the field (e.g. 82):", parse_mode='Markdown')
+            return QP_FIELD_RATE
+        try:
+            rate = float(text.lstrip('$'))
+            if rate < 0:
+                raise ValueError
+            context.user_data['qp']['field_rate'] = rate
+        except ValueError:
+            await self.send(update, "Please enter a valid dollar amount (e.g. 82):", parse_mode='Markdown')
+            return QP_FIELD_RATE
         return await self._send_quickpoll_final(update, context)
 
     async def _send_quickpoll_final(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3493,7 +3793,12 @@ class SoccerBotV2:
             admin_id=qp['admin_id'],
             field_rate=qp.get('field_rate')
         )
-        
+
+        # Audit-log the field rate captured at creation (charged at close, not now)
+        if poll_id and qp.get('field_rate') is not None:
+            self.log_field_rate_change(poll_id, update.effective_user, None,
+                                       qp.get('field_rate'), 'initial (wizard)')
+
         if deadline_time:
             deadline_str = deadline_time.strftime('%I:%M %p')
             
@@ -3634,6 +3939,10 @@ class SoccerBotV2:
         # Poll report date input
         if user_id in self._pending_pollreport:
             await self._handle_pollreport_date_input(update, context)
+            return
+        # /setfieldrate flow (date search or amount input)
+        if user_id in self._setfieldrate_pending:
+            await self._handle_setfieldrate_input(update, context)
             return
         # UX-4: guest add state
         if user_id in self._pending_guest_add:
@@ -4939,6 +5248,7 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('waive', self.waive_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('initchats', self.initchats_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('pollreport', self.pollreport_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('setfieldrate', self.setfieldrate_cmd, filters=filters.ChatType.PRIVATE))
 
         # Approval callbacks (approve/discard buttons on admin DMs)
         self.application.add_handler(CallbackQueryHandler(self.handle_approval_callback, pattern='^(approve|discard):'))
