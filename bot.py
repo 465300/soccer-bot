@@ -903,6 +903,16 @@ class SoccerBotV2:
         # Multiple groups - need interactive selection
         return (None, None)
 
+    @staticmethod
+    def wallet_key(user) -> str | None:
+        """Canonical wallet anchor: a player's Telegram @username, normalized.
+        Usernames are the ONLY valid anchor — there is no first_name fallback.
+        Returns None when the user has not set a username."""
+        uname = getattr(user, 'username', None)
+        if not uname:
+            return None
+        return uname.lstrip('@')
+
     def get_wallet(self, username: str) -> dict | None:
         """Fetch wallet record by username. Returns dict or None if not found."""
         conn = sqlite3.connect(DB_FILE)
@@ -1077,7 +1087,11 @@ class SoccerBotV2:
         """Player tapped 'I've Paid' — submit for super-admin approval (trust-based)."""
         await query.answer()
         user = query.from_user
-        username = user.username or user.first_name
+        username = self.wallet_key(user)
+        if not username:
+            await query.edit_message_text(
+                "⚠️ Set a Telegram username (Settings → Username) to use the wallet, then try again.")
+            return
         # Super-admin tops up themselves — auto-approve, no confirmation needed
         if SUPER_ADMIN_ID and user.id == SUPER_ADMIN_ID:
             now = datetime.now(TZ).isoformat()
@@ -1254,7 +1268,10 @@ class SoccerBotV2:
     async def wallet_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/wallet — show balance, eligibility, and recent activity privately."""
         user = update.effective_user
-        username = user.username or user.first_name
+        username = self.wallet_key(user)
+        if not username:
+            await self.send(update, "⚠️ Set a Telegram username (Settings → Username) to use the wallet.")
+            return
         wallet = self.get_wallet(username)
         if not wallet:
             await self.send(update, "You don't have a wallet yet. Run /topup to get started.")
@@ -1305,7 +1322,10 @@ class SoccerBotV2:
     async def cashout_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/cashout — begin a withdrawal request."""
         user = update.effective_user
-        username = user.username or user.first_name
+        username = self.wallet_key(user)
+        if not username:
+            await self.send(update, "⚠️ Set a Telegram username (Settings → Username) to use the wallet.")
+            return ConversationHandler.END
         wallet = self.get_wallet(username)
         if not wallet or wallet['balance'] <= 0:
             await self.send(update, "Your wallet is empty — nothing to cash out.")
@@ -1829,10 +1849,14 @@ class SoccerBotV2:
             return game_date
 
     def _mention(self, name, user_id) -> str:
-        """Clickable mention that works even for users without a public @handle."""
+        """Clickable mention. Prefers a tg://user link (works for any account when
+        we know the id); otherwise falls back to @username, which Telegram
+        auto-links for public handles."""
         disp = self._esc(name or 'player')
         if user_id:
             return f'<a href="tg://user?id={user_id}">{disp}</a>'
+        if name:
+            return f'@{disp}'
         return disp
 
     def quickpoll_keyboard(self, poll_id: int) -> InlineKeyboardMarkup:
@@ -2134,7 +2158,13 @@ class SoccerBotV2:
     async def process_quickpoll_vote(self, query, poll_id: int, vote_type: str):
         """Process a vote on a quick poll — enforces the wallet gate and per-vote charge."""
         user = query.from_user
-        username = user.username or user.first_name
+        username = self.wallet_key(user)
+        if not username:
+            await self._safe_answer(
+                query,
+                "⚠️ Set a Telegram username (Settings → Username) to join games.",
+                show_alert=True)
+            return
 
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -2327,7 +2357,7 @@ class SoccerBotV2:
     async def guest_add_trigger(self, query, poll_id: int):
         """➕ Guest button tapped — gate check, wallet eligibility, then DM the user."""
         user = query.from_user
-        username = user.username or user.first_name
+        username = self.wallet_key(user)
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         # Gate: must be IN on this poll
@@ -2410,7 +2440,7 @@ class SoccerBotV2:
             await self.send(update, f"❌ Name too long (max 60 chars): {bad[0]}. Try again or /cancel to abort.")
             self._pending_guest_add[user.id] = pending  # put back
             return
-        username = user.username or user.first_name
+        username = self.wallet_key(user)
         # Re-check wallet eligibility for this many new guests
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
