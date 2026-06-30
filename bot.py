@@ -93,7 +93,7 @@ ADMIN_COMMANDS = {
     'sendvenmolink', 'waive', 'initchats',
     'addplayer', 'removeplayer', 'nudge',
     'addmember', 'removemember', 'members',
-    'pollreport', 'setfieldrate',
+    'pollreport', 'playerreport', 'setfieldrate',
     # Admins get everything except the money commands below.
     'addadmin', 'removeadmin', 'listadmins', 'wallethistory',
     'switchgroup', 'mygroups',
@@ -115,6 +115,7 @@ class SoccerBotV2:
         self._pending_guest_remove: dict[int, dict] = {}  # user_id -> {poll_id, guests: [(id, name), ...]}
         self._cqpg_pending: dict[int, tuple] = {}  # user_id -> (poll_id, chat_id, group_name) from group picker
         self._pending_pollreport: dict[int, dict] = {}  # user_id -> {chat_id, group_name} waiting for date input
+        self._pollreport_range: dict[int, tuple] = {}  # user_id -> (start,end) carried through the group picker
         self._setfieldrate_pending: dict[int, dict] = {}  # user_id -> {stage, chat_id, group_name, poll_id} for /setfieldrate flow
         self._grouppick_pending: dict[int, dict] = {}  # user_id -> {action, payload} awaiting a generic group pick
         self.init_database()
@@ -240,6 +241,7 @@ class SoccerBotV2:
         player_cmds = [
             BotCommand('start', 'Get started / see what I can do'),
             BotCommand('wallet', 'Check your balance and recent activity'),
+            BotCommand('myreport', 'Your game-by-game cost history and wallet activity'),
             BotCommand('topup', 'Add funds to join games ($10/game)'),
             BotCommand('cashout', 'Withdraw your balance to Venmo'),
             BotCommand('cancel', 'Cancel whatever you\'re doing right now'),
@@ -273,7 +275,8 @@ class SoccerBotV2:
             BotCommand('removeadmin', 'Revoke admin access — /removeadmin @username'),
             BotCommand('listadmins', 'See all admins for a group'),
             BotCommand('wallethistory', 'Full transaction history for a player — /wallethistory @user'),
-            BotCommand('pollreport', 'Game attendance CSV — /pollreport 2026-05 or /pollreport 2026-05-01 2026-06-30'),
+            BotCommand('pollreport', 'Per-game accounting report — shares, guests, who paid, totals'),
+            BotCommand('playerreport', 'View any player\'s game cost + wallet report'),
             BotCommand('setfieldrate', 'Set/fix the field cost for a game — charges each player their share'),
         ]
         super_cmds = [
@@ -1319,6 +1322,190 @@ class SoccerBotV2:
         except (ValueError, TypeError):
             return str(iso_str)[:10]
 
+    # ── Player reports (game-by-game + wallet activity) ───────────────────
+    REPORT_RECENT_N = 4  # default number of games shown before "see all"
+
+    def _poll_units(self, c, poll_id: int) -> int:
+        """How many people/units split a poll's field cost, derived from the charge
+        ledger. A solo player (no guest) pays exactly one unit, so the smallest
+        charge on the poll is the per-unit price; total / per-unit = units."""
+        rows = c.execute(
+            "SELECT amount FROM payment_confirmations WHERE notes = ?",
+            (f"quickpoll_vote:{poll_id}",)).fetchall()
+        charges = [abs(r[0]) for r in rows if r[0]]
+        if not charges:
+            return 0
+        per_unit = min(charges)
+        if per_unit <= 0:
+            return len(charges)
+        return round(sum(charges) / per_unit)
+
+    def _build_player_report(self, username: str, show_all: bool,
+                             chat_ids: list[int] | None = None, display_name: str | None = None):
+        """Render a player's game-by-game cost report plus wallet activity.
+
+        Reads from the charge ledger (payment_confirmations tagged
+        'quickpoll_vote:{poll_id}') joined to quickpolls — this is the
+        authoritative record, not quickpoll_votes. Returns (text, total_games).
+        """
+        from collections import defaultdict
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        w = c.execute(
+            "SELECT balance FROM wallets WHERE LOWER(username) = LOWER(?)",
+            (username,)).fetchone()
+        balance = w[0] if w else 0.0
+
+        # Aggregate game charges by poll (a player has one net charge per poll).
+        charge_rows = c.execute(
+            "SELECT amount, notes FROM payment_confirmations "
+            "WHERE LOWER(username) = LOWER(?) AND notes LIKE 'quickpoll_vote:%'",
+            (username,)).fetchall()
+        by_poll: dict[int, float] = defaultdict(float)
+        for amt, notes in charge_rows:
+            try:
+                by_poll[int(notes.split(':')[1])] += abs(amt)
+            except (ValueError, IndexError):
+                continue
+
+        games = []
+        for pid, paid in by_poll.items():
+            meta = c.execute(
+                "SELECT game_date, location_name, field_rate, chat_id FROM quickpolls WHERE id = ?",
+                (pid,)).fetchone()
+            if not meta:
+                continue
+            gd, loc, fr, cid = meta
+            if chat_ids and cid not in chat_ids:
+                continue
+            games.append((gd, paid, loc or '', fr or 0.0, self._poll_units(c, pid)))
+        games.sort(key=lambda g: g[0])
+        total_games = len(games)
+        total_spend = sum(g[1] for g in games)
+
+        # Wallet activity = everything that isn't a game charge (top-ups, refunds, etc.)
+        acts = c.execute(
+            "SELECT amount, payment_date, notes FROM payment_confirmations "
+            "WHERE LOWER(username) = LOWER(?) AND notes NOT LIKE 'quickpoll_vote:%' "
+            "ORDER BY payment_date", (username,)).fetchall()
+        conn.close()
+
+        total_in = sum(a[0] for a in acts if a[0] and a[0] > 0)
+
+        shown = games if show_all else games[-self.REPORT_RECENT_N:]
+        who = self._esc(display_name or f"@{username}")
+        if total_games == 0:
+            head = f"📊 <b>Game Report — {who}</b>\n\nNo games on record yet."
+        else:
+            scope = (f"all {total_games} game{'s' if total_games != 1 else ''}"
+                     if (show_all or total_games <= self.REPORT_RECENT_N)
+                     else f"last {len(shown)} of {total_games} games")
+            head = f"📊 <b>Game Report — {who}</b>  <i>({scope})</i>\n"
+        lines = [head]
+
+        for gd, paid, loc, fr, units in shown:
+            unit_txt = f"{units} player{'s' if units != 1 else ''}" if units else "—"
+            lines.append(
+                f"\n🗓 <b>{self._esc(gd)}</b> · {self._esc(loc)}\n"
+                f"   You paid <b>${paid:.2f}</b> · {unit_txt} split ${fr:.0f}")
+        if total_games:
+            sub = sum(g[1] for g in shown)
+            lines.append(f"\n<i>Subtotal ({len(shown)} game{'s' if len(shown) != 1 else ''}): ${sub:.2f}</i>")
+
+        if acts:
+            lines.append("\n\n💵 <b>Wallet activity</b>")
+            for amt, pdate, notes in acts:
+                sign = "+" if amt >= 0 else "−"
+                lines.append(f"  {self._esc(pdate)}  {sign}${abs(amt):.2f}  {self._esc(self._txn_label(notes))}")
+
+        lines.append("\n────────────")
+        lines.append(f"💰 <b>Balance: ${balance:.2f}</b>")
+        lines.append(f"<i>Total paid in: ${total_in:.2f} · Total game spend: ${total_spend:.2f}</i>")
+        return "\n".join(lines), total_games
+
+    def _report_markup(self, show_all: bool, total_games: int, suffix: str = ""):
+        """Build the show-all / show-recent toggle button for a player report.
+        suffix is appended to callback data so the admin view can carry a username."""
+        if total_games <= self.REPORT_RECENT_N:
+            return None
+        if show_all:
+            label, action = "↩️ Show recent only", "recent"
+        else:
+            label, action = f"📜 See all {total_games} games", "all"
+        prefix = "plrep" if suffix else "myrep"
+        data = f"{prefix}:{action}" + (f":{suffix}" if suffix else "")
+        return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=data)]])
+
+    async def myreport_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/myreport — a player's own game-by-game cost + wallet activity."""
+        user = update.effective_user
+        username = self.wallet_key(user)
+        if not username:
+            await self.send(update, "⚠️ Set a Telegram username (Settings → Username) to use reports.")
+            return
+        text, total = self._build_player_report(username, show_all=False, display_name=f"@{username}")
+        await self.send(update, text, parse_mode='HTML',
+                        reply_markup=self._report_markup(False, total))
+
+    async def handle_myreport_callback(self, query, action: str):
+        """Toggle a player's own report between recent and full history."""
+        await query.answer()
+        username = self.wallet_key(query.from_user)
+        if not username:
+            return
+        show_all = (action == 'all')
+        text, total = self._build_player_report(username, show_all=show_all, display_name=f"@{username}")
+        await query.edit_message_text(text, parse_mode='HTML',
+                                      reply_markup=self._report_markup(show_all, total))
+
+    async def playerreport_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/playerreport — admin views any player's report via an inline picker."""
+        user = update.effective_user
+        if not (self.is_super_admin(user.id) or self.is_admin_any_chat(user.id, user.username)):
+            await self.send(update, "❌ Admin only.")
+            return
+        groups = self._admin_groups(user.id)
+        if not groups:
+            await self.send(update, "❌ You don't manage any group yet.")
+            return
+        chat_ids = [g[0] for g in groups]
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        placeholders = ','.join('?' * len(chat_ids))
+        rows = c.execute(
+            f"SELECT DISTINCT pc.username FROM payment_confirmations pc "
+            f"JOIN quickpolls q ON ('quickpoll_vote:' || q.id) = pc.notes "
+            f"WHERE q.chat_id IN ({placeholders}) ORDER BY LOWER(pc.username)", chat_ids).fetchall()
+        conn.close()
+        players = [r[0] for r in rows]
+        if not players:
+            await self.send(update, "No player charges found for your group yet.")
+            return
+        buttons, row = [], []
+        for name in players:
+            row.append(InlineKeyboardButton(name, callback_data=f"plpick:{name}"))
+            if len(row) == 2:
+                buttons.append(row); row = []
+        if row:
+            buttons.append(row)
+        await self.send(update, "📊 <b>Player Report</b> — pick a player:",
+                        parse_mode='HTML', reply_markup=InlineKeyboardMarkup(buttons))
+
+    async def handle_playerreport_pick(self, query, username: str):
+        """Admin picked a player from the report picker."""
+        await query.answer()
+        text, total = self._build_player_report(username, show_all=False, display_name=f"@{username}")
+        await query.edit_message_text(text, parse_mode='HTML',
+                                      reply_markup=self._report_markup(False, total, suffix=username))
+
+    async def handle_playerreport_callback(self, query, action: str, username: str):
+        """Toggle an admin-viewed player report between recent and full history."""
+        await query.answer()
+        show_all = (action == 'all')
+        text, total = self._build_player_report(username, show_all=show_all, display_name=f"@{username}")
+        await query.edit_message_text(text, parse_mode='HTML',
+                                      reply_markup=self._report_markup(show_all, total, suffix=username))
+
     async def cashout_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/cashout — begin a withdrawal request."""
         user = update.effective_user
@@ -1613,169 +1800,231 @@ class SoccerBotV2:
             parse_mode='Markdown')
 
     async def pollreport_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show inline group picker, then accept a date range and deliver a CSV report."""
+        """Air-tight per-game accounting report built from the charge ledger.
+        Period is chosen via inline buttons or optional command args
+        (/pollreport 2026-05 or /pollreport 2026-05-01 2026-06-30) — there is no
+        lingering free-text state, so it can't collide with other command flows."""
         user = update.effective_user
         if not (self.is_super_admin(user.id) or self.is_admin_any_chat(user.id, user.username)):
             await self.send(update, "❌ Admin only.")
             return
-
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("""SELECT cg.chat_id, cg.group_name
-                     FROM chat_groups cg
-                     JOIN chat_admins ca ON cg.chat_id = ca.chat_id
-                     WHERE ca.user_id = ?
-                     ORDER BY cg.group_name""", (user.id,))
-        groups = c.fetchall()
-        conn.close()
-
+        rng, err = self._parse_report_range(context.args) if context.args else (None, None)
+        if err:
+            await self.send(update, err, parse_mode='Markdown')
+            return
+        groups = self._admin_groups(user.id)
         if not groups:
             await self.send(update, "❌ No groups found. You must be an admin of a registered group.")
             return
-
         if len(groups) == 1:
             chat_id, group_name = groups[0]
-            self._pending_pollreport[user.id] = {'chat_id': chat_id, 'group_name': group_name}
-            await self.send(update,
-                f"📊 *Poll Report* — `{group_name}`\n\n"
-                "Enter date range:\n"
-                "• `2026-05` → full month\n"
-                "• `2026-05-01 2026-06-30` → custom range",
-                parse_mode='Markdown')
-        else:
-            buttons = [[InlineKeyboardButton(name, callback_data=f"prpt_group:{cid}")]
-                       for cid, name in groups]
-            await self.send(update, "📊 *Poll Report — Select a group:*",
-                            parse_mode='Markdown',
-                            reply_markup=InlineKeyboardMarkup(buttons))
+            if rng:
+                await self._render_pollreport(update.effective_chat.id, chat_id, group_name, rng)
+            else:
+                await self.send(update,
+                    f"📊 <b>Poll Report</b> — {self._esc(group_name)}\nPick a period:",
+                    parse_mode='HTML', reply_markup=self._pollreport_period_kb(chat_id))
+            return
+        self._pollreport_range[user.id] = rng
+        buttons = [[InlineKeyboardButton(name, callback_data=f"prg:{cid}")] for cid, name in groups]
+        await self.send(update, "📊 <b>Poll Report</b> — select a group:",
+                        parse_mode='HTML', reply_markup=InlineKeyboardMarkup(buttons))
+
+    def _pollreport_period_kb(self, chat_id: int) -> InlineKeyboardMarkup:
+        """Period-selection buttons for the poll report."""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 All games", callback_data=f"prp:{chat_id}:all")],
+            [InlineKeyboardButton("📅 This month", callback_data=f"prp:{chat_id}:thismonth"),
+             InlineKeyboardButton("📆 Last month", callback_data=f"prp:{chat_id}:lastmonth")],
+        ])
+
+    def _parse_report_range(self, parts):
+        """['2026-05'] or ['2026-05-01','2026-06-30'] → ((start,end),None) or (None,error)."""
+        USAGE = "Format: `2026-05` for a month, or `2026-05-01 2026-06-30` for a range."
+        try:
+            if len(parts) == 1:
+                dt = datetime.strptime(parts[0], "%Y-%m")
+                start = dt.replace(day=1)
+                end = (dt.replace(day=31) if dt.month == 12
+                       else dt.replace(month=dt.month + 1, day=1) - timedelta(days=1))
+                return (start, end), None
+            if len(parts) == 2:
+                return (datetime.strptime(parts[0], "%Y-%m-%d"),
+                        datetime.strptime(parts[1], "%Y-%m-%d")), None
+        except ValueError:
+            return None, f"❌ Couldn't parse that. {USAGE}"
+        return None, f"❌ Unexpected format. {USAGE}"
+
+    def _period_range(self, key: str):
+        """Period button key → (start, end) datetimes; (None, None) means all-time."""
+        now = datetime.now(TZ).replace(tzinfo=None)
+        if key == 'thismonth':
+            return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0), now
+        if key == 'lastmonth':
+            end = now.replace(day=1) - timedelta(days=1)
+            return (end.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                    end.replace(hour=23, minute=59, second=59))
+        return None, None
 
     async def handle_pollreport_group_callback(self, query, chat_id_str: str):
-        """Admin tapped a group button on the poll report group picker."""
+        """Admin tapped a group → apply a stashed range or show period buttons."""
         await query.answer()
         chat_id = int(chat_id_str)
-        user_id = query.from_user.id
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT group_name FROM chat_groups WHERE chat_id = ?", (chat_id,))
         row = c.fetchone()
         conn.close()
         group_name = row[0] if row else str(chat_id)
-        self._pending_pollreport[user_id] = {'chat_id': chat_id, 'group_name': group_name}
-        await query.edit_message_text(
-            f"📊 *Poll Report* — `{group_name}`\n\n"
-            "Enter date range:\n"
-            "• `2026-05` → full month\n"
-            "• `2026-05-01 2026-06-30` → custom range",
-            parse_mode='Markdown')
-
-    async def _handle_pollreport_date_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Process the date range text the admin typed after selecting a group."""
-        user_id = update.effective_user.id
-        pending = self._pending_pollreport.pop(user_id, None)
-        if not pending:
-            return
-        grp_chat_id = pending['chat_id']
-        group_name = pending['group_name']
-        parts = update.message.text.strip().split()
-        start_date = end_date = None
-        USAGE = "Format: `2026-05` for a full month, or `2026-05-01 2026-06-30` for a custom range."
-
-        if len(parts) == 1:
-            try:
-                dt = datetime.strptime(parts[0], "%Y-%m")
-                start_date = dt.replace(day=1)
-                end_date = (dt.replace(day=31) if dt.month == 12
-                            else dt.replace(month=dt.month + 1, day=1) - timedelta(days=1))
-            except ValueError:
-                self._pending_pollreport[user_id] = pending
-                await self.send(update, f"❌ Couldn't parse that. {USAGE}", parse_mode='Markdown')
-                return
-        elif len(parts) == 2:
-            try:
-                start_date = datetime.strptime(parts[0], "%Y-%m-%d")
-                end_date = datetime.strptime(parts[1], "%Y-%m-%d")
-            except ValueError:
-                self._pending_pollreport[user_id] = pending
-                await self.send(update, f"❌ Couldn't parse that. {USAGE}", parse_mode='Markdown')
-                return
+        rng = self._pollreport_range.pop(query.from_user.id, None)
+        if rng:
+            await query.edit_message_text(f"📊 Poll Report — {group_name}")
+            await self._render_pollreport(query.message.chat.id, chat_id, group_name, rng)
         else:
-            self._pending_pollreport[user_id] = pending
-            await self.send(update, f"❌ Unexpected format. {USAGE}", parse_mode='Markdown')
-            return
+            await query.edit_message_text(
+                f"📊 <b>Poll Report</b> — {self._esc(group_name)}\nPick a period:",
+                parse_mode='HTML', reply_markup=self._pollreport_period_kb(chat_id))
 
+    async def handle_pollreport_period_callback(self, query, chat_id_str: str, key: str):
+        """Admin tapped a period button → render the report."""
+        await query.answer()
+        chat_id = int(chat_id_str)
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("""SELECT q.id, q.game_date, q.location_name, q.max_players, q.field_rate,
-                            COUNT(CASE WHEN v.vote_type='in' THEN 1 END) as in_count,
-                            COUNT(CASE WHEN v.vote_type='out' THEN 1 END) as out_count
-                     FROM quickpolls q
-                     LEFT JOIN quickpoll_votes v ON v.poll_id = q.id
-                     WHERE q.closed = 1 AND q.chat_id = ?
-                     GROUP BY q.id""", (grp_chat_id,))
-        rows = c.fetchall()
+        c.execute("SELECT group_name FROM chat_groups WHERE chat_id = ?", (chat_id,))
+        row = c.fetchone()
+        conn.close()
+        group_name = row[0] if row else str(chat_id)
+        label = {'all': 'All games', 'thismonth': 'This month', 'lastmonth': 'Last month'}.get(key, '')
+        await query.edit_message_text(f"📊 Poll Report — {group_name} · {label}")
+        await self._render_pollreport(query.message.chat.id, chat_id, group_name, self._period_range(key))
 
-        DATE_FORMATS = ["%Y-%m-%d", "%m/%d/%Y", "%m/%d", "%b %d", "%B %d", "%B %d, %Y"]
-
-        def parse_game_date(raw):
-            if not raw:
-                return None
-            for fmt in DATE_FORMATS:
-                try:
-                    d = datetime.strptime(raw.strip(), fmt)
-                    if d.year == 1900:
-                        d = d.replace(year=datetime.now().year)
-                    return d
-                except ValueError:
-                    continue
+    def _parse_game_date(self, raw):
+        """Best-effort parse of a quickpolls.game_date value (ISO preferred)."""
+        if not raw:
             return None
-
-        results = []
-        for poll_id, game_date_raw, location, max_players, field_rate, in_count, out_count in rows:
-            d = parse_game_date(game_date_raw)
-            if not d or not (start_date <= d <= end_date):
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d", "%b %d", "%B %d", "%B %d, %Y"):
+            try:
+                d = datetime.strptime(raw.strip(), fmt)
+                return d.replace(year=datetime.now().year) if d.year == 1900 else d
+            except ValueError:
                 continue
-            gc_count = c.execute("""SELECT COUNT(*) FROM quickpoll_guests
-                                    WHERE poll_id = ? AND confirmed IN (1, 2)""",
-                                 (poll_id,)).fetchone()[0]
-            voters = c.execute("""SELECT username FROM quickpoll_votes
-                                  WHERE poll_id = ? AND vote_type = 'in'
-                                  ORDER BY voted_at ASC""", (poll_id,)).fetchall()
-            player_list = "; ".join(r[0] for r in voters)
-            rate_pct = f"{round(in_count / max_players * 100)}%" if max_players and in_count else ""
-            total_units = in_count + gc_count
-            per_player = f"${field_rate / total_units:.2f}" if field_rate and total_units else ""
-            results.append({
-                "game_date": d.strftime("%Y-%m-%d"),
-                "location": location or "",
-                "total_in": in_count,
-                "total_out": out_count,
-                "total_guests": gc_count,
-                "participation_rate": rate_pct,
-                "field_rate": f"${field_rate:.2f}" if field_rate else "",
-                "per_player_charge": per_player,
-                "players": player_list,
-            })
+        return None
+
+    def _pollreport_block(self, c, pid, gd, loc, fr, closed, roster):
+        """Build one game's accounting block from the charge ledger (authoritative).
+        Returns (html_text, stats). Guest counts come from each player's paid units,
+        never from the unreconciled quickpoll_votes/quickpoll_guests tables."""
+        from collections import defaultdict
+        paid = defaultdict(float)
+        for u, a in c.execute("SELECT username, amount FROM payment_confirmations WHERE notes = ?",
+                              (f"quickpoll_vote:{pid}",)):
+            paid[u] += abs(a)
+        paid = {u: v for u, v in paid.items() if v > 0}
+        field = fr or 0.0
+        date_lbl = self._esc(self._pretty_date(gd) if gd else 'TBD')
+        if not paid:
+            txt = (f"🗓 <b>{date_lbl}</b> · {self._esc(loc or '')}\n"
+                   f"   <i>No charges recorded"
+                   + (f" · field ${field:.2f}" if field else "") + "</i>")
+            return txt, {'field': field, 'collected': 0.0, 'players': 0, 'guests': 0}
+        per_unit = min(paid.values())
+        rows, total_units = [], 0
+        for u, amt in paid.items():
+            units = round(amt / per_unit) if per_unit > 0 else 1
+            total_units += units
+            rows.append((amt, units, u))
+        rows.sort(key=lambda r: (-r[0], r[2].lower()))
+        n_players = len(rows)
+        n_guests = total_units - n_players
+        collected = sum(paid.values())
+        surplus = collected - field
+        lines = [f"🗓 <b>{date_lbl}</b> · {self._esc(loc or '')}"]
+        if n_guests:
+            detail = (f"{total_units} players ({n_players} in + "
+                      f"{n_guests} guest{'s' if n_guests != 1 else ''})")
+        else:
+            detail = f"{total_units} player{'s' if total_units != 1 else ''}"
+        lines.append(f"💵 Field ${field:.2f} · ${per_unit:.2f}/share · {detail}")
+        lines.append(f"✅ Collected ${collected:.2f}"
+                     + (f" · surplus ${surplus:.2f}" if abs(surplus) >= 0.005 else "")
+                     + ("" if closed else " · ⚠️ poll still open"))
+        lines.append(f"\n<b>IN ({n_players}):</b>")
+        for amt, units, u in rows:
+            extra = f" <i>(+{units - 1} guest{'s' if units - 1 != 1 else ''})</i>" if units > 1 else ""
+            lines.append(f"  @{self._esc(u)} — ${amt:.2f}{extra}")
+        bringers = [(u, units - 1) for amt, units, u in rows if units > 1]
+        if bringers:
+            lines.append("<b>Guests brought by:</b> "
+                         + ", ".join(f"@{self._esc(u)} (+{g})" for u, g in bringers))
+        in_set = {u.lower() for u in paid}
+        n_out = sum(1 for m in roster if m.lower() not in in_set)
+        lines.append(f"<b>OUT:</b> {n_out}")
+        return "\n".join(lines), {'field': field, 'collected': collected,
+                                  'players': n_players, 'guests': n_guests}
+
+    async def _render_pollreport(self, send_chat_id, group_chat_id, group_name, rng):
+        """Build and send the per-game accounting report for a group + period."""
+        start, end = rng
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        roster = [r[0] for r in c.execute("SELECT username FROM wallets ORDER BY LOWER(username)")]
+        polls = c.execute(
+            "SELECT id, game_date, location_name, field_rate, closed FROM quickpolls WHERE chat_id = ?",
+            (group_chat_id,)).fetchall()
+        selected = []
+        for pid, gd, loc, fr, closed in polls:
+            d = self._parse_game_date(gd)
+            if start and end and (not d or not (start <= d <= end)):
+                continue
+            selected.append((d or datetime.max, pid, gd, loc, fr, closed))
+        selected.sort(key=lambda x: x[0])
+
+        blocks = []
+        tot_field = tot_collected = 0.0
+        tot_players = tot_guests = 0
+        for _, pid, gd, loc, fr, closed in selected:
+            block, stats = self._pollreport_block(c, pid, gd, loc, fr, closed, roster)
+            blocks.append(block)
+            tot_field += stats['field']
+            tot_collected += stats['collected']
+            tot_players += stats['players']
+            tot_guests += stats['guests']
         conn.close()
 
-        if not results:
-            await self.send(update, f"No closed polls found for {group_name} in that period.")
+        if not blocks:
+            await self.application.bot.send_message(
+                send_chat_id, f"No games found for {group_name} in that period.")
             return
+        period_lbl = (f"{start.strftime('%b %d')} – {end.strftime('%b %d, %Y')}"
+                      if start and end else "all games")
+        header = (f"📊 <b>{self._esc(group_name)} — Accounting Report</b>\n"
+                  f"<i>{period_lbl} · {len(blocks)} game{'s' if len(blocks) != 1 else ''}</i>")
+        footer = ("═══════════\n"
+                  f"<b>TOTALS · {len(blocks)} game{'s' if len(blocks) != 1 else ''}</b>\n"
+                  f"Field cost: ${tot_field:.2f} · Collected: ${tot_collected:.2f} "
+                  f"(surplus ${tot_collected - tot_field:.2f})\n"
+                  f"Players: {tot_players} · Guests: {tot_guests}")
+        await self._send_report_chunks(send_chat_id, header, blocks, footer)
 
-        results.sort(key=lambda r: r["game_date"])
-        buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=["game_date", "location", "total_in", "total_out",
-                                                  "total_guests", "participation_rate",
-                                                  "field_rate", "per_player_charge", "players"])
-        writer.writeheader()
-        writer.writerows(results)
-        csv_bytes = buf.getvalue().encode('utf-8')
-        range_label = parts[0].replace('-', '_') if len(parts) == 1 else f"{parts[0]}_to_{parts[1]}"
-        filename = f"poll_report_{group_name}_{range_label}.csv"
-        await update.message.reply_document(
-            document=io.BytesIO(csv_bytes),
-            filename=filename,
-            caption=f"📊 {group_name} — {len(results)} game{'s' if len(results) != 1 else ''} — {start_date.strftime('%b %d')} to {end_date.strftime('%b %d, %Y')}"
-        )
+    async def _send_report_chunks(self, chat_id, header, blocks, footer):
+        """Send header + game blocks + footer, splitting into <4000-char messages."""
+        msg = header
+        for b in blocks:
+            if len(msg) + len(b) + 2 > 3900:
+                await self.application.bot.send_message(
+                    chat_id, msg, parse_mode='HTML', disable_web_page_preview=True)
+                msg = ""
+            msg += ("\n\n" if msg else "") + b
+        if len(msg) + len(footer) + 2 > 3900:
+            await self.application.bot.send_message(
+                chat_id, msg, parse_mode='HTML', disable_web_page_preview=True)
+            msg = footer
+        else:
+            msg += ("\n\n" if msg else "") + footer
+        if msg:
+            await self.application.bot.send_message(
+                chat_id, msg, parse_mode='HTML', disable_web_page_preview=True)
 
     async def initchats_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/initchats — Broadcast a DM-invite message to all groups you manage."""
@@ -2101,14 +2350,28 @@ class SoccerBotV2:
             parts = query.data.split(':')  # cqpg:{chat_id}:{poll_id}
             await self.handle_cancelqp_group_callback(query, parts[1], parts[2])
             return
-        if query.data.startswith('prpt_group:'):
+        if query.data.startswith('prg:'):
             await self.handle_pollreport_group_callback(query, query.data.split(':', 1)[1])
+            return
+        if query.data.startswith('prp:'):
+            _, cid, key = query.data.split(':', 2)
+            await self.handle_pollreport_period_callback(query, cid, key)
             return
         if query.data.startswith('sfr_group:'):
             await self.handle_setfieldrate_group_callback(query, query.data.split(':', 1)[1])
             return
         if query.data.startswith('gpick:'):
             await self.handle_grouppick_callback(update, query.data.split(':', 1)[1])
+            return
+        if query.data.startswith('myrep:'):
+            await self.handle_myreport_callback(query, query.data.split(':', 1)[1])
+            return
+        if query.data.startswith('plpick:'):
+            await self.handle_playerreport_pick(query, query.data.split(':', 1)[1])
+            return
+        if query.data.startswith('plrep:'):
+            _, action, uname = query.data.split(':', 2)
+            await self.handle_playerreport_callback(query, action, uname)
             return
         if query.data == 'sfr_older':
             await self.handle_setfieldrate_older_callback(query)
@@ -4017,10 +4280,6 @@ class SoccerBotV2:
         """Handle admin's response to late arrivals prompt — also handles UX-4 guest name/number replies."""
         user_id = update.effective_user.id
 
-        # Poll report date input
-        if user_id in self._pending_pollreport:
-            await self._handle_pollreport_date_input(update, context)
-            return
         # /setfieldrate flow (date search or amount input)
         if user_id in self._setfieldrate_pending:
             await self._handle_setfieldrate_input(update, context)
@@ -5487,6 +5746,8 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('removemember', self.removemember_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('members', self.members_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('wallet', self.wallet_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('myreport', self.myreport_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('playerreport', self.playerreport_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('topup', self.topup_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('voidpayment', self.voidpayment_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('deletepayment', self.deletepayment_cmd, filters=filters.ChatType.PRIVATE))
