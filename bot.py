@@ -100,6 +100,66 @@ ADMIN_COMMANDS = {
 # Money commands stay super-admin-only (super admin's personal Venmo account).
 SUPER_ADMIN_ONLY_COMMANDS = {'voidpayment', 'deletepayment', 'adjustbalance'}
 
+# ── /menu hub ────────────────────────────────────────────────────────────────
+# Inline command launcher. Each cell is (emoji-label, command). A command of
+# None marks a non-actionable section header. Tapping a button either runs the
+# command directly (no-arg commands) or replies with a usage hint (arg / wizard
+# commands) — see MENU_DIRECT / MENU_HINTS below.
+MENU_PLAYER_LAYOUT = [
+    [('💰 Wallet', 'wallet'), ('📊 My Report', 'myreport')],
+    [('➕ Top Up', 'topup'), ('💸 Cash Out', 'cashout')],
+]
+MENU_ADMIN_LAYOUT = [
+    [('⚽ GAMES', None)],
+    [('🆕 Quickpoll', 'quickpoll'), ('🔒 Close', 'closepoll'), ('🔄 Refresh', 'refreshpoll')],
+    [('➕ Add Player', 'addplayer'), ('➖ Rm Player', 'removeplayer'), ('👤 Add Guest', 'addguest')],
+    [('📣 Nudge', 'nudge'), ('⚖️ Teams', 'maketeams'), ('❌ Cancel Game', 'cancelquickpoll')],
+    [('💰 MONEY', None)],
+    [('💵 Field Rate', 'setfieldrate'), ('📋 Poll Report', 'pollreport'), ('🧾 Player Report', 'playerreport')],
+    [('📜 Wallet Hx', 'wallethistory'), ('🔗 Venmo Link', 'sendvenmolink'), ('🎟️ Waive', 'waive')],
+    [('👥 ROSTER', None)],
+    [('➕ Member', 'addmember'), ('➖ Member', 'removemember'), ('📇 Members', 'members')],
+    [('⭐ Set Skill', 'setskill'), ('📈 Skills', 'skills'), ('🗑️ Del Skill', 'deleteskill')],
+    [('⚙️ GROUPS', None)],
+    [('🔀 Switch Grp', 'switchgroup'), ('📂 My Groups', 'mygroups'), ('📋 List Chats', 'listchats')],
+    [('👑 Add Admin', 'addadmin'), ('🚫 Rm Admin', 'removeadmin'), ('👥 Admins', 'listadmins')],
+    [('📨 Init Chats', 'initchats')],
+]
+MENU_SUPER_LAYOUT = [
+    [('🔐 SUPER', None)],
+    [('↩️ Void Pay', 'voidpayment'), ('🗑️ Del Pay', 'deletepayment'), ('⚖️ Adjust Bal', 'adjustbalance')],
+]
+# Commands that run directly on tap (no-arg display / picker commands). Each maps
+# to a method named f'{cmd}_cmd'.
+MENU_DIRECT = {
+    'wallet', 'myreport', 'topup',
+    'closepoll', 'refreshpoll', 'nudge', 'maketeams',
+    'setfieldrate', 'pollreport', 'playerreport',
+    'members', 'skills',
+    'switchgroup', 'mygroups', 'listchats', 'listadmins', 'initchats',
+}
+# Commands that need arguments or start a wizard — tapping shows a usage hint.
+MENU_HINTS = {
+    'quickpoll': "🆕 To create a game, type /quickpoll — I'll walk you through the setup.",
+    'cancelquickpoll': "❌ To cancel a game and refund everyone, type /cancelquickpoll.",
+    'cashout': "💸 To withdraw your balance, type /cashout — I'll walk you through it.",
+    'addplayer': "➕ Force-add a player:\n/addplayer @username [reason]",
+    'removeplayer': "➖ Force-remove a player:\n/removeplayer @username [reason]",
+    'addguest': "👤 Add a guest under an IN player:\n/addguest @inviter <Guest Name>",
+    'addmember': "➕ Add players to the nudge roster:\n/addmember @user1 @user2 …",
+    'removemember': "➖ Remove players from the roster:\n/removemember @user1 @user2 …",
+    'setskill': "⭐ Set a player's skill rating:\n/setskill Name 1-10",
+    'deleteskill': "🗑️ Remove a player's skill rating:\n/deleteskill Name",
+    'addadmin': "👑 Give someone admin access:\n/addadmin @username",
+    'removeadmin': "🚫 Revoke admin access:\n/removeadmin @username",
+    'wallethistory': "📜 Full transaction history for a player:\n/wallethistory @username",
+    'sendvenmolink': "🔗 Push the top-up card to a player:\n/sendvenmolink @username",
+    'waive': "🎟️ One-game wallet bypass for a player:\n/waive @username",
+    'voidpayment': "↩️ Reverse a payment:\n/voidpayment <payment_id>",
+    'deletepayment': "🗑️ Delete a payment record:\n/deletepayment <payment_id>",
+    'adjustbalance': "⚖️ Adjust a wallet balance:\n/adjustbalance @username amount",
+}
+
 
 class SoccerBotV2:
     def __init__(self, token: str):
@@ -238,6 +298,7 @@ class SoccerBotV2:
         the super admin does EXCEPT the money commands (super-only)."""
         player_cmds = [
             BotCommand('start', 'Get started / see what I can do'),
+            BotCommand('menu', 'Open the command menu'),
             BotCommand('wallet', 'Check your balance and recent activity'),
             BotCommand('myreport', 'Your game-by-game cost history and wallet activity'),
             BotCommand('topup', 'Add funds to join games ($10/game)'),
@@ -2602,6 +2663,11 @@ class SoccerBotV2:
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
+
+        # /menu hub button taps
+        if query.data.startswith('menu:'):
+            await self.handle_menu_callback(update, context, query.data.split(':', 1)[1])
+            return
 
         # Wallet / top-up callbacks (colon-delimited, handled before the '_' split)
         if query.data.startswith('topup:'):
@@ -5612,6 +5678,59 @@ class SoccerBotV2:
 
         await self.send(update, "✅ Quick poll cancelled.")
 
+    def _build_menu_markup(self, layout):
+        """Turn a MENU_*_LAYOUT structure into an InlineKeyboardMarkup."""
+        rows = []
+        for row in layout:
+            buttons = []
+            for label, cmd in row:
+                data = 'menu:noop' if cmd is None else f'menu:{cmd}'
+                buttons.append(InlineKeyboardButton(label, callback_data=data))
+            rows.append(buttons)
+        return InlineKeyboardMarkup(rows)
+
+    async def menu_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Role-aware inline command launcher. Players see a small wallet menu;
+        admins/super-admins see the full categorized command hub."""
+        user = update.effective_user
+        role = self._role_for(user)
+        if role in ('super', 'admin'):
+            layout = list(MENU_ADMIN_LAYOUT)
+            if role == 'super':
+                layout = layout + MENU_SUPER_LAYOUT
+            header = "🛡️ <b>Admin Menu</b> — tap a command"
+        else:
+            layout = MENU_PLAYER_LAYOUT
+            header = "⚽ <b>Menu</b> — what do you want to do?"
+        await self.send(update, header, parse_mode='HTML',
+                        reply_markup=self._build_menu_markup(layout))
+
+    async def handle_menu_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
+        """Dispatch a /menu button tap: run no-arg commands directly, or reply
+        with a usage hint for arg/wizard commands."""
+        query = update.callback_query
+        if cmd == 'noop':
+            await self._safe_answer(query)
+            return
+        user = query.from_user
+        role = self._role_for(user)
+        # Defense-in-depth role gate (each command method also re-checks).
+        if cmd in SUPER_ADMIN_ONLY_COMMANDS and role != 'super':
+            await self._safe_answer(query, "❌ Not allowed.", show_alert=True)
+            return
+        if cmd in ADMIN_COMMANDS and role not in ('super', 'admin'):
+            await self._safe_answer(query, "❌ Not allowed.", show_alert=True)
+            return
+        await self._safe_answer(query)
+        if cmd in MENU_HINTS:
+            await self.send(update, MENU_HINTS[cmd])
+            return
+        if cmd in MENU_DIRECT:
+            context.args = []
+            method = getattr(self, f'{cmd}_cmd', None)
+            if method:
+                await method(update, context)
+
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Warm welcome message with role-aware guidance."""
         user = update.effective_user
@@ -5787,6 +5906,7 @@ class SoccerBotV2:
 
         # Standalone commands
         self.application.add_handler(CommandHandler('start', self.start_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('menu', self.menu_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('setchat', self.set_chat, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(ChatMemberHandler(self.handle_bot_added_to_group, ChatMemberHandler.MY_CHAT_MEMBER))
         self.application.add_handler(CommandHandler('switchgroup', self.switchgroup_cmd, filters=filters.ChatType.PRIVATE))
