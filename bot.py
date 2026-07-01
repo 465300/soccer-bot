@@ -91,7 +91,7 @@ ADMIN_COMMANDS = {
     'setskill', 'skills', 'deleteskill',
     'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats',
     'sendvenmolink', 'waive', 'initchats',
-    'addplayer', 'removeplayer', 'nudge',
+    'addplayer', 'removeplayer', 'addguest', 'nudge',
     'addmember', 'removemember', 'members',
     'pollreport', 'playerreport', 'setfieldrate',
     # Admins get everything except the money commands below.
@@ -252,6 +252,7 @@ class SoccerBotV2:
             BotCommand('refreshpoll', 'Push latest buttons to an existing poll card'),
             BotCommand('addplayer', 'Force-add a player to the latest game — /addplayer @user [reason]'),
             BotCommand('removeplayer', 'Force-remove a player from the latest game — /removeplayer @user'),
+            BotCommand('addguest', 'Add a guest under an IN player — /addguest @inviter <Guest Name>'),
             BotCommand('nudge', 'Ping members who haven\'t voted yet — /nudge [poll_id]'),
             BotCommand('addmember', 'Add players to the nudge roster — /addmember @user …'),
             BotCommand('removemember', 'Remove players from the roster — /removemember @user …'),
@@ -4737,6 +4738,8 @@ class SoccerBotV2:
         """Route a group-resolved action to its core handler."""
         if action == 'addplayer':
             await self._do_addplayer(update, payload, chat_id)
+        elif action == 'addguest':
+            await self._do_addguest(update, payload, chat_id)
         elif action == 'removeplayer':
             await self._do_removeplayer(update, payload, chat_id)
         elif action == 'closepoll':
@@ -5052,6 +5055,79 @@ class SoccerBotV2:
 
         await self.refresh_quickpoll_message(poll_id)
         await self.send(update, f"✅ @{target} added IN.")
+
+    async def addguest_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin override: add a guest under an IN player on the latest poll, even
+        after it closes — but only while there's still room (IN players +
+        confirmed guests < max). On a closed poll the guest takes the open spot
+        and the field cost is re-split across everyone (net-delta). On an open
+        poll the guest is waitlisted and allocated/charged at close like a +1."""
+        if len(context.args) < 2:
+            await self.send(update, "Usage: /addguest @inviter <Guest Name>")
+            return
+        inviter = context.args[0].lstrip('@')
+        guest_name = ' '.join(context.args[1:]).strip()
+        if not guest_name:
+            await self.send(update, "Usage: /addguest @inviter <Guest Name>")
+            return
+        await self._resolve_group(update, 'addguest',
+                                  {'inviter': inviter, 'guest_name': guest_name},
+                                  require_poll=True, open_only=False)
+
+    async def _do_addguest(self, update: Update, payload: dict, chat_id: int):
+        """Add a guest under an IN inviter on the resolved group's latest poll."""
+        inviter = payload['inviter']
+        guest_name = payload['guest_name']
+        poll = self._latest_poll_in_chat(chat_id)
+        if not poll:
+            await self.send(update, "❌ No recent poll found to adjust.")
+            return
+        poll_id, max_players = poll[0], (poll[1] or 0)
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        # Inviter must be IN on this poll. Pull the EXACT stored username so the
+        # guest attributes to them in _apply_field_charges (which folds by username).
+        c.execute("""SELECT user_id, username FROM quickpoll_votes
+                     WHERE poll_id = ? AND LOWER(username) = LOWER(?) AND vote_type = 'in'""",
+                  (poll_id, inviter))
+        vr = c.fetchone()
+        if not vr:
+            conn.close()
+            await self.send(update, f"❌ @{inviter} isn't IN for this game — only IN players can bring a guest.")
+            return
+        inviter_uid, inviter_key = vr[0], vr[1]
+
+        # Capacity (your rule): IN voters + already-confirmed guests must be below max.
+        c.execute("SELECT COUNT(*) FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
+        in_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND confirmed = 1", (poll_id,))
+        confirmed_guests = c.fetchone()[0]
+        c.execute("SELECT closed FROM quickpolls WHERE id = ?", (poll_id,))
+        crow = c.fetchone()
+        is_closed = bool(crow[0]) if crow else False
+        if max_players and (in_count + confirmed_guests) >= max_players:
+            conn.close()
+            await self.send(update,
+                f"❌ Game is full ({in_count + confirmed_guests}/{max_players}) — no room for a guest.")
+            return
+
+        # Closed poll → confirmed (takes the spot now); open poll → waitlist for close.
+        confirmed = 1 if is_closed else 0
+        c.execute("""INSERT INTO quickpoll_guests
+                     (poll_id, member_user_id, member_username, guest_name, confirmed)
+                     VALUES (?, ?, ?, ?, ?)""",
+                  (poll_id, inviter_uid, inviter_key, guest_name, confirmed))
+        conn.commit()
+        conn.close()
+
+        if is_closed:
+            # Re-split the field cost across the new headcount (net-delta): the
+            # inviter is charged the guest's share, everyone else is refunded a bit.
+            await self._apply_field_charges(poll_id)
+        await self.refresh_quickpoll_message(poll_id)
+        where = "added to the game" if is_closed else "waitlisted (charged at close)"
+        await self.send(update, f"✅ Guest \"{guest_name}\" {where} under @{inviter}.")
 
     async def removeplayer_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Admin override: force-remove a player from the latest poll, even
@@ -5774,6 +5850,7 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('closepoll', self.closepoll_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('refreshpoll', self.refreshpoll_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('addplayer', self.addplayer_cmd, filters=filters.ChatType.PRIVATE))
+        self.application.add_handler(CommandHandler('addguest', self.addguest_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('removeplayer', self.removeplayer_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('nudge', self.nudge_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('addmember', self.addmember_cmd, filters=filters.ChatType.PRIVATE))
