@@ -53,9 +53,6 @@ WEBHOOK_PORT = int(os.getenv('PORT', '8080'))
 # States for quickpoll conversation
 QP_GROUP_SELECT, QP_LOCATION_NAME, QP_LOCATION_LINK, QP_DATE, QP_TIME_START, QP_TIME_END, QP_MAX_PLAYERS, QP_DEADLINE, QP_AUTO_TEAMS, QP_NUM_TEAMS = range(100, 110)
 
-# States for late arrivals input
-AWAITING_LATE_ARRIVALS_INPUT = 110
-
 # Pre-fill check state for quickpoll repeat
 QP_REPEAT_CHECK = 111
 
@@ -91,7 +88,7 @@ PLAYER_COMMANDS = {'wallet', 'topup', 'cashout', 'cancel'}
 ADMIN_COMMANDS = {
     'quickpoll', 'cancelquickpoll', 'closepoll', 'refreshpoll', 'maketeams',
     'setskill', 'skills', 'deleteskill',
-    'viewlate', 'addlate', 'removelate', 'clearlate', 'listchats',
+    'listchats',
     'sendvenmolink', 'waive', 'initchats',
     'addplayer', 'removeplayer', 'addguest', 'nudge',
     'addmember', 'removemember', 'members',
@@ -111,7 +108,6 @@ class SoccerBotV2:
         self._processing = False
         self._pending_teams: dict[str, str] = {}  # key -> prebuilt teams message text
         self._pending_cancels: dict[str, str] = {}  # key -> cancel group message text
-        self._pending_late_arrivals: dict[int, dict] = {}  # admin_id -> {poll_id, chat_id, players_list}
         self._refresh_tasks: dict[int, asyncio.Task] = {}  # poll_id -> pending debounced card-refresh task
         self._pending_guest_add: dict[int, dict] = {}  # user_id -> {poll_id}
         self._pending_guest_remove: dict[int, dict] = {}  # user_id -> {poll_id, guests: [(id, name), ...]}
@@ -264,10 +260,6 @@ class SoccerBotV2:
             BotCommand('setskill', 'Set a player\'s skill rating — /setskill Name 1-10'),
             BotCommand('skills', 'See all player skill ratings'),
             BotCommand('deleteskill', 'Remove a player\'s skill rating'),
-            BotCommand('viewlate', 'See who was marked late for a poll'),
-            BotCommand('addlate', 'Mark a player as late — /addlate poll_id username'),
-            BotCommand('removelate', 'Undo a late mark — /removelate poll_id username'),
-            BotCommand('clearlate', 'Clear all late flags for a poll — /clearlate poll_id'),
             BotCommand('switchgroup', 'Choose which group to target with commands'),
             BotCommand('mygroups', 'See all groups you manage'),
             BotCommand('listchats', 'See all the groups you manage'),
@@ -598,7 +590,9 @@ class SoccerBotV2:
             chat_id INTEGER PRIMARY KEY,
             group_name TEXT UNIQUE,
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-        # Late arrivals table - track who was late for each poll
+        # Late arrivals table — DORMANT. The late-arrival feature (commands,
+        # after-game prompt/announce, and the vote gate) was removed 2026-07-01.
+        # Table kept so existing prod data isn't dropped; nothing reads/writes it.
         c.execute('''CREATE TABLE IF NOT EXISTS late_arrivals (
             id INTEGER PRIMARY KEY,
             poll_id INTEGER,
@@ -763,86 +757,6 @@ class SoccerBotV2:
             await self.application.bot.delete_message(chat_id=chat_id, message_id=message_id)
         except Exception as e:
             logger.warning(f"Could not delete message {message_id} in {chat_id}: {e}")
-
-    def parse_game_datetime(self, game_date_str: str, time_start_str: str) -> datetime | None:
-        """Try to parse flexible date/time strings into a datetime object.
-        Returns None if parsing fails.
-        Tries common formats: MM/DD/YYYY, MM-DD-YYYY, YYYY-MM-DD, etc.
-        Times: HH:MM, H:MM, HH:MM AM/PM, etc."""
-        if not game_date_str or not time_start_str:
-            return None
-            
-        # Common date formats to try
-        date_formats = [
-            '%m/%d/%Y', '%m/%d/%y', '%m-%d-%Y', '%m-%d-%y',
-            '%Y-%m-%d', '%Y/%m/%d', '%d/%m/%Y', '%d-%m-%Y',
-            '%B %d, %Y', '%b %d, %Y', '%B %d, %y', '%b %d, %y',
-            '%A %B %d, %Y', '%A %b %d, %Y', '%A %B %d', '%A %b %d',  # With day-of-week
-            '%B %d', '%b %d',  # Month name + day (no year)
-            '%m/%d', '%m-%d'  # No year (numeric)
-        ]
-        
-        # Common time formats to try
-        time_formats = [
-            '%H:%M', '%H:%M:%S', '%I:%M %p', '%I:%M:%S %p',
-            '%I %p', '%H', '%I:%M%p'  # No separators
-        ]
-        
-        date_obj = None
-        time_obj = None
-        
-        # Try parsing date
-        for fmt in date_formats:
-            try:
-                parsed = datetime.strptime(game_date_str.strip(), fmt)
-                date_obj = parsed.date()
-                # If no year was parsed, use current year
-                if '%Y' not in fmt and '%y' not in fmt:
-                    today = datetime.now(TZ).date()
-                    date_obj = date_obj.replace(year=today.year)
-                    # If parsed date is in the past, try next year
-                    if date_obj < today:
-                        date_obj = date_obj.replace(year=today.year + 1)
-                break
-            except ValueError:
-                continue
-        
-        # Try parsing time
-        for fmt in time_formats:
-            try:
-                parsed = datetime.strptime(time_start_str.strip(), fmt)
-                time_obj = parsed.time()
-                break
-            except ValueError:
-                continue
-        
-        # If we got both date and time, combine them
-        if date_obj and time_obj:
-            try:
-                dt = datetime.combine(date_obj, time_obj)
-                if dt.tzinfo is None:
-                    dt = TZ.localize(dt)
-                return dt
-            except Exception:
-                return None
-        
-        logger.warning(f"Could not parse game_date '{game_date_str}' with time_start '{time_start_str}'")
-        return None
-
-    def schedule_late_arrivals_events(self, poll_id: int, chat_id: int, admin_id: int, 
-                                       game_start_time: datetime):
-        """Schedule prompt and announce events for late arrivals."""
-        # Schedule prompt at game_start_time - 5 minutes
-        prompt_time = game_start_time - timedelta(minutes=5)
-        self.schedule_event('prompt_late_arrivals', prompt_time, {
-            'poll_id': poll_id, 'chat_id': chat_id, 'admin_id': admin_id
-        })
-        
-        # Schedule announcement at game_start_time + 2 hours
-        announce_time = game_start_time + timedelta(hours=2)
-        self.schedule_event('announce_late_arrivals', announce_time, {
-            'poll_id': poll_id, 'chat_id': chat_id, 'admin_id': admin_id
-        })
 
     def schedule_nudge_events(self, poll_id: int, chat_id: int, deadline_time: datetime):
         """UX-3: schedule non-voter nudges before the deadline. Only intervals
@@ -2822,18 +2736,6 @@ class SoccerBotV2:
             await self.dm_closed_poll_contact(user.id, poll_chat_id)
             return
 
-        # Late-arrival block — players blocked from this poll cannot vote
-        c.execute("""SELECT 1 FROM late_arrivals
-                     WHERE blocked_from_poll_id = ? AND LOWER(username) = LOWER(?)
-                     AND cleared_at IS NULL""", (poll_id, username))
-        if c.fetchone():
-            conn.close()
-            await self._safe_answer(
-                query,
-                "⚠️ You arrived late to the previous game and can't join this poll.",
-                show_alert=True)
-            return
-
         # Read the existing vote (drives idempotency + refund detection)
         c.execute("SELECT vote_type FROM quickpoll_votes WHERE poll_id = ? AND user_id = ?",
                   (poll_id, user.id))
@@ -3870,127 +3772,6 @@ class SoccerBotV2:
         else:
             await self.send(update, f"❌ Player not found")
 
-    # ===== LATE ARRIVALS COMMANDS =====
-
-    async def viewlate_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """View late arrivals for a poll: /viewlate [poll_id]"""
-        if not context.args:
-            # Show most recent
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("SELECT id FROM late_arrivals WHERE cleared_at IS NULL ORDER BY added_at DESC LIMIT 1")
-            result = c.fetchone()
-            conn.close()
-            if not result:
-                await self.send(update, "❌ No active late arrivals found.")
-                return
-            poll_id = result[0]
-        else:
-            try:
-                poll_id = int(context.args[0])
-            except ValueError:
-                await self.send(update, "Usage: /viewlate [poll_id]")
-                return
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("""SELECT username, blocked_from_poll_id, cleared_at 
-                     FROM late_arrivals WHERE poll_id = ? ORDER BY added_at ASC""",
-                  (poll_id,))
-        late_arrivals = c.fetchall()
-        conn.close()
-        
-        if not late_arrivals:
-            await self.send(update, f"📋 No late arrivals for poll {poll_id}")
-            return
-        
-        msg = f"⏰ *Late arrivals for poll {poll_id}:*\n\n"
-        for username, blocked_poll_id, cleared_at in late_arrivals:
-            safe_name = username.replace('_', '\\_')
-            status = "cleared" if cleared_at else ("next poll" if blocked_poll_id else "pending")
-            msg += f"• @{safe_name} ({status})\n"
-        
-        await self.send(update, msg, parse_mode='Markdown')
-
-    async def addlate_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Add a late arrival: /addlate poll_id username"""
-        if len(context.args) < 2:
-            await self.send(update, "Usage: /addlate poll_id username")
-            return
-        
-        try:
-            poll_id = int(context.args[0])
-        except ValueError:
-            await self.send(update, "First argument must be poll_id (number)")
-            return
-        
-        username = ' '.join(context.args[1:]).lstrip('@')
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        try:
-            c.execute("""INSERT INTO late_arrivals (poll_id, user_id, username, added_by_admin_id, added_at)
-                         VALUES (?, ?, ?, ?, ?)""",
-                      (poll_id, None, username, update.effective_user.id, datetime.now(TZ).isoformat()))
-            conn.commit()
-            safe_name = username.replace('_', '\\_')
-            await self.send(update, f"✅ Added @{safe_name} to late arrivals for poll {poll_id}")
-        except sqlite3.IntegrityError:
-            safe_name = username.replace('_', '\\_')
-            await self.send(update, f"⚠️ @{safe_name} already in late arrivals for poll {poll_id}")
-        finally:
-            conn.close()
-
-    async def removelate_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Remove a late arrival: /removelate poll_id username"""
-        if len(context.args) < 2:
-            await self.send(update, "Usage: /removelate poll_id username")
-            return
-        
-        try:
-            poll_id = int(context.args[0])
-        except ValueError:
-            await self.send(update, "First argument must be poll_id (number)")
-            return
-        
-        username = ' '.join(context.args[1:]).lstrip('@')
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("DELETE FROM late_arrivals WHERE poll_id = ? AND username = ?", (poll_id, username))
-        deleted = c.rowcount > 0
-        conn.commit()
-        conn.close()
-        
-        if deleted:
-            safe_name = username.replace('_', '\\_')
-            await self.send(update, f"✅ Removed @{safe_name} from late arrivals for poll {poll_id}")
-        else:
-            safe_name = username.replace('_', '\\_')
-            await self.send(update, f"❌ @{safe_name} not found in poll {poll_id}")
-
-    async def clearlate_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Mark all late arrivals for a poll as cleared: /clearlate poll_id"""
-        if not context.args:
-            await self.send(update, "Usage: /clearlate poll_id")
-            return
-        
-        try:
-            poll_id = int(context.args[0])
-        except ValueError:
-            await self.send(update, "Usage: /clearlate poll_id")
-            return
-        
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("""UPDATE late_arrivals SET cleared_at = ? WHERE poll_id = ? AND cleared_at IS NULL""",
-                  (datetime.now(TZ).isoformat(), poll_id))
-        updated = c.rowcount
-        conn.commit()
-        conn.close()
-        
-        await self.send(update, f"✅ Cleared {updated} late arrival records for poll {poll_id}")
-
     async def maketeams_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Create balanced teams: /maketeams [all] [N]. Without 'all', resolves
         the group (picker if you manage more than one) and uses that group's
@@ -4532,11 +4313,6 @@ class SoccerBotV2:
             # Schedule non-voter nudges at -24h / -12h / -2h (UX-3)
             self.schedule_nudge_events(poll_id, chat_id, deadline_time)
 
-            # Schedule late arrivals events (prompt at game_start - 5min, announce at game_start + 2hrs)
-            game_start_time = self.parse_game_datetime(qp['date'], qp['time_start'])
-            if game_start_time:
-                self.schedule_late_arrivals_events(poll_id, chat_id, qp['admin_id'], game_start_time)
-            
             if qp.get('auto_teams'):
                 # Schedule team selection at deadline
                 self.schedule_event('finalize_teams', deadline_time, {
@@ -4570,12 +4346,6 @@ class SoccerBotV2:
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                   (poll_id, location_name, location_link, max_players, deadline_iso, num_teams, chat_id, admin_id,
                    None, None, game_date, time_start, time_end, field_rate))
-
-        # Link any pending late arrivals from previous polls to this new poll
-        # (auto-link for next poll feature)
-        c.execute("""UPDATE late_arrivals SET blocked_from_poll_id = ?
-                     WHERE blocked_from_poll_id IS NULL AND cleared_at IS NULL""",
-                  (poll_id,))
 
         conn.commit()
         conn.close()
@@ -4654,8 +4424,9 @@ class SoccerBotV2:
 
         return None, "❌ No active group set. Run /switchgroup to choose a group."
 
-    async def handle_late_arrivals_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin's response to late arrivals prompt — also handles UX-4 guest name/number replies."""
+    async def handle_private_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Route private text replies to the right pending flow: /setfieldrate
+        input, or UX-4 guest add/remove replies."""
         user_id = update.effective_user.id
 
         # /setfieldrate flow (date search or amount input)
@@ -4670,57 +4441,6 @@ class SoccerBotV2:
         if user_id in self._pending_guest_remove:
             await self._handle_guest_remove_reply(update, context)
             return
-
-        # Check if this admin has a pending late arrivals prompt
-        if user_id not in self._pending_late_arrivals:
-            return
-        
-        pending = self._pending_late_arrivals[user_id]
-        poll_id = pending['poll_id']
-        chat_id = pending['chat_id']
-        players_list = pending['players']
-        
-        response = update.message.text.strip().lower()
-        
-        # Parse response
-        late_arrivals = []
-        if response != 'skip':
-            try:
-                # Parse comma-separated numbers
-                indices = [int(x.strip()) - 1 for x in response.split(',')]
-                # Map to actual player names
-                for idx in indices:
-                    if 0 <= idx < len(players_list):
-                        late_arrivals.append(players_list[idx])
-            except (ValueError, IndexError):
-                await self.send(update, "❌ Invalid format. Please reply with numbers like `1,3,5` or `skip`.")
-                return
-        
-        # Save to database
-        if late_arrivals:
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            
-            for username in late_arrivals:
-                try:
-                    c.execute("""INSERT INTO late_arrivals 
-                                 (poll_id, user_id, username, is_member, added_by_admin_id, added_at)
-                                 VALUES (?, ?, ?, ?, ?, ?)""",
-                              (poll_id, None, username, 1, user_id, datetime.now(TZ).isoformat()))
-                except sqlite3.IntegrityError:
-                    # Already exists, update it
-                    c.execute("""UPDATE late_arrivals SET added_at = ? WHERE poll_id = ? AND username = ?""",
-                              (datetime.now(TZ).isoformat(), poll_id, username))
-            
-            conn.commit()
-            conn.close()
-            
-            await self.send(update, f"✅ Recorded {len(late_arrivals)} late arrivals. Announcement will post in ~2 hours.")
-        else:
-            await self.send(update, "✅ No late arrivals recorded.")
-        
-        # Clean up state
-        del self._pending_late_arrivals[user_id]
 
     # ===== APPROVAL WORKFLOW =====
 
@@ -4753,7 +4473,7 @@ class SoccerBotV2:
 
         data = query.data.split(':')
         decision = data[0]  # approve / discard
-        action = data[1]    # roster / teams / cancel / announce_late / ...
+        action = data[1]    # roster / teams / cancel / ...
         
         # safely parse remaining args
         try:
@@ -4764,15 +4484,6 @@ class SoccerBotV2:
             return
 
         if decision == 'discard':
-            if action == 'announce_late':
-                # Remove from DB if discarded
-                conn = sqlite3.connect(DB_FILE)
-                c = conn.cursor()
-                c.execute("""UPDATE late_arrivals SET cleared_at = ? 
-                             WHERE blocked_from_poll_id = ? AND cleared_at IS NULL""",
-                          (datetime.now(TZ).isoformat(), poll_id))
-                conn.commit()
-                conn.close()
             await query.edit_message_text(f"❌ Action '{action}' discarded.")
             return
 
@@ -4798,28 +4509,6 @@ class SoccerBotV2:
                 text=cancel_msg,
                 parse_mode='Markdown'
             )
-        
-        elif action == 'announce_late':
-            # Get and post the late arrivals announcement
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("""SELECT username FROM late_arrivals 
-                         WHERE blocked_from_poll_id = ? AND cleared_at IS NULL
-                         ORDER BY added_at ASC""", (poll_id,))
-            late_players = [row[0] for row in c.fetchall()]
-            conn.close()
-            
-            if late_players:
-                msg = "⚠️ *You will sit out next game:*\n\n"
-                for i, username in enumerate(late_players, 1):
-                    safe_name = username.replace('_', '\\_')
-                    msg += f"{i}. @{safe_name}\n"
-                
-                await self.application.bot.send_message(
-                    chat_id=chat_id, 
-                    text=msg, 
-                    parse_mode='Markdown'
-                )
 
     async def post_roster(self, poll_id: int, chat_id: int, force_send: bool = False):
         """Post the final roster — everyone who voted IN (the cap is enforced at voting time)"""
@@ -5635,78 +5324,6 @@ class SoccerBotV2:
             "Teams created. Post to group?"
         )
 
-    async def prompt_late_arrivals(self, poll_id: int, chat_id: int, admin_id: int):
-        """Prompt admin to enter names of players who arrived late (5 min before game start)"""
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        # Get IN voters from the quickpoll
-        c.execute("""SELECT username FROM quickpoll_votes
-                     WHERE poll_id = ? AND vote_type = 'in'
-                     ORDER BY voted_at ASC""", (poll_id,))
-        in_players = [row[0] for row in c.fetchall()]
-        conn.close()
-        
-        if not in_players:
-            logger.info(f"No IN voters for poll {poll_id}, skipping late arrivals prompt")
-            return
-        
-        # Store state for when admin replies
-        self._pending_late_arrivals[admin_id] = {
-            'poll_id': poll_id,
-            'chat_id': chat_id,
-            'players': in_players
-        }
-        
-        # Build numbered list
-        roster_msg = "⏰ *Who arrived late and should sit out?*\n\nToday's players:\n"
-        for i, username in enumerate(in_players, 1):
-            safe_name = username.replace('_', '\\_')
-            roster_msg += f"{i}. @{safe_name}\n"
-        
-        roster_msg += "\n📝 *Reply with comma-separated numbers* (e.g., `1,3,5`)\nOr reply `skip` if everyone was on time."
-        
-        # Send to admin
-        try:
-            await self.application.bot.send_message(
-                chat_id=admin_id,
-                text=roster_msg,
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            logger.error(f"Failed to send late arrivals prompt to admin {admin_id}: {e}")
-
-    async def announce_late_arrivals(self, poll_id: int, chat_id: int, admin_id: int):
-        """Post announcement of who was late (2 hours after game start)"""
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        # Get late arrivals for this poll
-        c.execute("""SELECT username FROM late_arrivals 
-                     WHERE poll_id = ? AND cleared_at IS NULL
-                     ORDER BY added_at ASC""", (poll_id,))
-        late_players = [row[0] for row in c.fetchall()]
-        conn.close()
-        
-        # If no late arrivals, nothing to announce
-        if not late_players:
-            logger.info(f"No late arrivals for poll {poll_id}, skipping announcement")
-            return
-        
-        # Build announcement message
-        msg = "⚠️ *You will sit out next game:*\n\n"
-        for i, username in enumerate(late_players, 1):
-            safe_name = username.replace('_', '\\_')
-            msg += f"{i}. @{safe_name}\n"
-        
-        # Request approval before posting
-        await self.request_approval(
-            admin_id,
-            msg,
-            f"announce_late:{poll_id}:{chat_id}",
-            "Post announcement to group?"
-        )
-
     # ===== DB-BASED SCHEDULING =====
 
     def schedule_event(self, event_type: str, fire_time, payload: dict):
@@ -5750,10 +5367,6 @@ class SoccerBotV2:
                         # Live card IS the roster — no separate roster post needed
                     elif event_type == 'finalize_teams':
                         await self.finalize_teams(payload['poll_id'], payload['chat_id'], payload['admin_id'])
-                    elif event_type == 'prompt_late_arrivals':
-                        await self.prompt_late_arrivals(payload['poll_id'], payload['chat_id'], payload['admin_id'])
-                    elif event_type == 'announce_late_arrivals':
-                        await self.announce_late_arrivals(payload['poll_id'], payload['chat_id'], payload['admin_id'])
                     elif event_type == 'nudge_nonvoters':
                         await self.nudge_nonvoters(payload['poll_id'], payload['chat_id'])
                 except Exception as e:
@@ -6185,10 +5798,6 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('setskill', self.setskill_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('skills', self.skills_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('deleteskill', self.deleteskill_cmd, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('viewlate', self.viewlate_cmd, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('addlate', self.addlate_cmd, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('removelate', self.removelate_cmd, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('clearlate', self.clearlate_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('maketeams', self.maketeams_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('closepoll', self.closepoll_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('refreshpoll', self.refreshpoll_cmd, filters=filters.ChatType.PRIVATE))
@@ -6218,10 +5827,10 @@ class SoccerBotV2:
         # All other inline callbacks (votes, status, etc.)
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
 
-        # Late arrivals input (admin responding to bot prompt in private)
+        # Private text router (setfieldrate input, guest add/remove replies)
         self.application.add_handler(MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            self.handle_late_arrivals_input
+            self.handle_private_text_input
         ))
 
         # Unknown message fallback for private chats
