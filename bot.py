@@ -653,7 +653,9 @@ class SoccerBotV2:
             reason TEXT,
             changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
         # UX-4: guest (+1) system — inviter brings named guest(s) to a quickpoll
-        # confirmed: 0=waitlisted, 1=confirmed+charged, 2=pending_payment (inviter short)
+        # confirmed: 0=waitlisted (no spot yet), 1=confirmed (has a spot; inviter
+        # charged the guest's share at close). State 2 is unused — short inviters
+        # are pushed negative instead of being denied a spot.
         c.execute('''CREATE TABLE IF NOT EXISTS quickpoll_guests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             poll_id INTEGER NOT NULL,
@@ -970,10 +972,17 @@ class SoccerBotV2:
         conn.close()
         return True
 
-    def deduct_wallet(self, username: str, amount: float, reason: str = "vote_cost") -> bool:
-        """Subtract funds from wallet. Returns False if insufficient balance."""
+    def deduct_wallet(self, username: str, amount: float, reason: str = "vote_cost",
+                      allow_negative: bool = False) -> bool:
+        """Subtract funds from wallet. Returns False if the wallet doesn't exist,
+        or (when allow_negative is False) if the balance can't cover the amount.
+        With allow_negative=True the balance is pushed negative anyway — the
+        'negative = owes' model used for close-time field charges so nobody is
+        dropped from a game for a low balance."""
         wallet = self.get_wallet(username)
-        if not wallet or wallet['balance'] < amount:
+        if not wallet:
+            return False
+        if not allow_negative and wallet['balance'] < amount:
             return False
 
         conn = sqlite3.connect(DB_FILE)
@@ -2153,10 +2162,10 @@ class SoccerBotV2:
                 except (ValueError, TypeError):
                     pass
 
-        # On a closed poll only show guests that were confirmed (1) or spot-held pending
-        # payment (2). Waitlisted guests (0) were not awarded a spot and must not appear.
+        # On a closed poll only show guests that were confirmed (1) — they got a
+        # spot and were charged. Waitlisted guests (0) were not awarded a spot.
         if closed:
-            visible_guests = [(mu, gn) for mu, gn, conf in guest_rows if conf in (1, 2)]
+            visible_guests = [(mu, gn) for mu, gn, conf in guest_rows if conf == 1]
         else:
             visible_guests = [(mu, gn) for mu, gn, conf in guest_rows]
 
@@ -2565,8 +2574,8 @@ class SoccerBotV2:
         if old_vote == 'in' and vote_type == 'out':
             gconn = sqlite3.connect(DB_FILE)
             gc = gconn.cursor()
-            gc.execute("SELECT id, guest_name FROM quickpoll_guests WHERE poll_id = ? AND member_user_id = ?",
-                       (poll_id, user.id))
+            gc.execute("SELECT id, guest_name FROM quickpoll_guests WHERE poll_id = ? AND LOWER(member_username) = LOWER(?)",
+                       (poll_id, username))
             guests = gc.fetchall()
             gconn.close()
             if guests:
@@ -2617,6 +2626,25 @@ class SoccerBotV2:
 
     # ── UX-4: Guest system ─────────────────────────────────────────────────
 
+    def _estimate_guest_share(self, poll_id: int) -> float:
+        """Best-effort per-person share for the guest add-gate: field_rate over the
+        projected headcount (current IN voters + guests already on the poll). Falls
+        back to VOTE_COST when no field rate is set yet. The exact charge is
+        reconciled at close by _apply_field_charges."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT field_rate FROM quickpolls WHERE id = ?", (poll_id,))
+        r = c.fetchone()
+        field_rate = r[0] if r else None
+        c.execute("SELECT COUNT(*) FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
+        ins = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ?", (poll_id,))
+        gnum = c.fetchone()[0]
+        conn.close()
+        if not field_rate or field_rate <= 0:
+            return VOTE_COST
+        return round(field_rate / max(1, ins + gnum), 2)
+
     async def guest_add_trigger(self, query, poll_id: int):
         """➕ Guest button tapped — gate check, wallet eligibility, then DM the user."""
         user = query.from_user
@@ -2631,14 +2659,17 @@ class SoccerBotV2:
             conn.close()
             await self._safe_answer(query, "You need to vote IN before adding a guest.", show_alert=True)
             return
-        # Wallet eligibility: balance - ($10 × (existing_guests + 1)) >= WALLET_FLOOR
-        c.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND member_user_id = ?",
-                  (poll_id, user.id))
+        # Wallet eligibility: balance - (share × (existing_guests + 1)) >= WALLET_FLOOR,
+        # where share is the projected per-person field cost (F5 — real share, not a
+        # flat $10 proxy). Guests are keyed by the canonical username (F2).
+        c.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND LOWER(member_username) = LOWER(?)",
+                  (poll_id, username))
         existing = c.fetchone()[0]
         conn.close()
+        share = self._estimate_guest_share(poll_id)
         wallet = self.get_wallet(username)
         balance = wallet['balance'] if wallet else 0
-        if balance - (VOTE_COST * (existing + 1)) < WALLET_FLOOR:
+        if balance - (share * (existing + 1)) < WALLET_FLOOR:
             msg = f"💳 Your balance won't cover another guest — top up to add guests."
             await self._safe_answer(query, msg, show_alert=True)
             await self.send_topup_prompt(user.id, msg)
@@ -2657,6 +2688,7 @@ class SoccerBotV2:
     async def guest_remove_trigger(self, query, poll_id: int):
         """🗑 My Guests button tapped — list guests and ask which to remove."""
         user = query.from_user
+        username = self.wallet_key(user)
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT vote_type FROM quickpoll_votes WHERE poll_id = ? AND user_id = ?",
@@ -2666,8 +2698,8 @@ class SoccerBotV2:
             conn.close()
             await self._safe_answer(query, "You need to be IN to manage your guests.", show_alert=True)
             return
-        c.execute("SELECT id, guest_name FROM quickpoll_guests WHERE poll_id = ? AND member_user_id = ? ORDER BY added_at ASC",
-                  (poll_id, user.id))
+        c.execute("SELECT id, guest_name FROM quickpoll_guests WHERE poll_id = ? AND LOWER(member_username) = LOWER(?) ORDER BY added_at ASC",
+                  (poll_id, username))
         guests = c.fetchall()
         conn.close()
         if not guests:
@@ -2704,16 +2736,17 @@ class SoccerBotV2:
             self._pending_guest_add[user.id] = pending  # put back
             return
         username = self.wallet_key(user)
-        # Re-check wallet eligibility for this many new guests
+        # Re-check wallet eligibility for this many new guests (F5 real share, F2 username key)
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND member_user_id = ?",
-                  (poll_id, user.id))
+        c.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND LOWER(member_username) = LOWER(?)",
+                  (poll_id, username))
         existing = c.fetchone()[0]
         conn.close()
+        share = self._estimate_guest_share(poll_id)
         wallet = self.get_wallet(username)
         balance = wallet['balance'] if wallet else 0
-        if balance - (VOTE_COST * (existing + len(names))) < WALLET_FLOOR:
+        if balance - (share * (existing + len(names))) < WALLET_FLOOR:
             await self.send(update, f"💳 Your balance won't cover {len(names)} guest(s) — top up and try again.")
             return
         conn = sqlite3.connect(DB_FILE)
@@ -2758,10 +2791,11 @@ class SoccerBotV2:
     async def guest_clear_on_out(self, query, poll_id: int):
         """User voted OUT and confirmed removing all their guests."""
         user = query.from_user
+        username = self.wallet_key(user)
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("DELETE FROM quickpoll_guests WHERE poll_id = ? AND member_user_id = ?",
-                  (poll_id, user.id))
+        c.execute("DELETE FROM quickpoll_guests WHERE poll_id = ? AND LOWER(member_username) = LOWER(?)",
+                  (poll_id, username))
         conn.commit()
         conn.close()
         await self._safe_answer(query, "✅ Your guests have been removed.")
@@ -2787,54 +2821,51 @@ class SoccerBotV2:
         self.schedule_quickpoll_refresh(poll_id)
 
     async def confirm_quickpoll_guests(self, poll_id: int, chat_id: int):
-        """At close: confirm guest spots, then charge all IN players based on
-        field_rate / total units (Path B — no upfront charge)."""
+        """At close: allocate guest spots up to capacity, then charge all IN
+        players based on field_rate / total units (Path B — no upfront charge).
+        Idempotent + re-close safe: spots already taken by confirmed guests are
+        subtracted from the remaining capacity, and guests whose inviter is no
+        longer IN are dropped at ANY confirmed state (F4)."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT max_players, field_rate FROM quickpolls WHERE id = ?", (poll_id,))
+        c.execute("SELECT max_players FROM quickpolls WHERE id = ?", (poll_id,))
         row = c.fetchone()
         if not row:
             conn.close()
             return
-        max_players, field_rate = row
-        max_players = max_players or 0
+        max_players = row[0] or 0
 
+        # Drop guests whose inviter is not IN (covers OUT-switch + /removeplayer),
+        # regardless of current confirmed state — a previously-confirmed guest of a
+        # now-OUT inviter is released and never charged.
+        c.execute("SELECT id, member_username FROM quickpoll_guests WHERE poll_id = ?", (poll_id,))
+        for gid, member_username in c.fetchall():
+            c.execute("SELECT vote_type FROM quickpoll_votes WHERE poll_id = ? AND LOWER(username) = LOWER(?)",
+                      (poll_id, member_username))
+            vr = c.fetchone()
+            if not vr or vr[0] != 'in':
+                c.execute("DELETE FROM quickpoll_guests WHERE id = ?", (gid,))
+        conn.commit()
+
+        # Remaining capacity = max − IN voters − guests already confirmed (so a
+        # second close pass never over-allocates beyond the cap).
         c.execute("SELECT COUNT(*) FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
         in_count = c.fetchone()[0]
-        remaining = max(0, max_players - in_count) if max_players else 999
+        c.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND confirmed = 1", (poll_id,))
+        already_confirmed = c.fetchone()[0]
+        remaining = max(0, max_players - in_count - already_confirmed) if max_players else None
 
-        # --- Step 1: Allocate guest spots (no money yet) ---
-        c.execute("""SELECT id, member_username, member_user_id, guest_name
-                     FROM quickpoll_guests WHERE poll_id = ? AND confirmed = 0
+        # Promote waitlisted (confirmed = 0) guests in arrival order until full.
+        c.execute("""SELECT id FROM quickpoll_guests WHERE poll_id = ? AND confirmed = 0
                      ORDER BY added_at ASC""", (poll_id,))
-        guests = c.fetchall()
+        waitlisted = [r[0] for r in c.fetchall()]
+        to_promote = waitlisted if remaining is None else waitlisted[:remaining]
+        for gid in to_promote:
+            c.execute("UPDATE quickpoll_guests SET confirmed = 1 WHERE id = ?", (gid,))
+        conn.commit()
         conn.close()
 
-        spots_used = 0
-        for gid, member_username, member_user_id, guest_name in guests:
-            vc = sqlite3.connect(DB_FILE)
-            vcc = vc.cursor()
-            vcc.execute("SELECT vote_type FROM quickpoll_votes WHERE poll_id = ? AND LOWER(username) = LOWER(?)",
-                        (poll_id, member_username))
-            vote_row = vcc.fetchone()
-            vc.close()
-            if not vote_row or vote_row[0] != 'in':
-                dc = sqlite3.connect(DB_FILE)
-                dcc = dc.cursor()
-                dcc.execute("DELETE FROM quickpoll_guests WHERE id = ?", (gid,))
-                dc.commit()
-                dc.close()
-                continue
-            if spots_used >= remaining:
-                continue  # No spot — leave waitlisted
-            uc = sqlite3.connect(DB_FILE)
-            ucc = uc.cursor()
-            ucc.execute("UPDATE quickpoll_guests SET confirmed = 1 WHERE id = ?", (gid,))
-            uc.commit()
-            uc.close()
-            spots_used += 1
-
-        # --- Step 2: Charge all IN players (Path B) ---
+        # --- Charge all IN players (Path B) ---
         # Net-delta reconciliation, shared with /setfieldrate so close-time and
         # later rate edits can never drift apart.
         await self._apply_field_charges(poll_id)
@@ -2858,12 +2889,14 @@ class SoccerBotV2:
         if not user_id:
             return
         guest_note = f" (you + {guest_count} guest{'s' if guest_count > 1 else ''})" if guest_count else ""
+        owe_note = (f"\n⚠️ Your balance is negative — you owe ${abs(new_balance):.2f}. Please top up."
+                    if new_balance < 0 else "")
         try:
             await self.application.bot.send_message(
                 chat_id=user_id,
                 text=(f"⚽ Your share for {game_label}{guest_note} is ${share:.2f}.\n"
                       f"${deducted:.2f} was deducted from your wallet.\n"
-                      f"💰 Wallet balance: ${new_balance:.2f}"))
+                      f"💰 Wallet balance: ${new_balance:.2f}{owe_note}"))
         except Exception as e:
             logger.warning(f"Could not DM field charge to {user_id}: {e}")
 
@@ -2894,13 +2927,11 @@ class SoccerBotV2:
             conn.close()
             return
         field_rate, location, game_date = row
-        c.execute("SELECT COUNT(*) FROM quickpoll_guests WHERE poll_id = ? AND confirmed IN (1, 2)", (poll_id,))
-        total_confirmed_guests = c.fetchone()[0]
         c.execute("SELECT username, user_id FROM quickpoll_votes WHERE poll_id = ? AND vote_type = 'in'", (poll_id,))
         in_voters = c.fetchall()
-        conn.close()
 
         if not field_rate or field_rate <= 0:
+            conn.close()
             if SUPER_ADMIN_ID:
                 try:
                     await self.application.bot.send_message(
@@ -2910,7 +2941,25 @@ class SoccerBotV2:
                     pass
             return
 
-        total_units = len(in_voters) + total_confirmed_guests
+        # F1: count ONLY guests attributed to an IN voter, so the denominator
+        # always equals the sum of what is actually charged. An orphan guest
+        # (member_username matches no IN voter — inviter switched OUT, stale name)
+        # would otherwise inflate the denominator and leak the field cost.
+        plan = []  # (username, user_id, guest_count, is_waived)
+        total_units = 0
+        for voter_username, voter_user_id in in_voters:
+            c.execute("""SELECT 1 FROM payment_confirmations
+                         WHERE LOWER(username) = LOWER(?) AND notes LIKE ? AND status = 'waived'""",
+                      (voter_username, f"waiver:#{poll_id}%"))
+            is_waived = c.fetchone() is not None
+            c.execute("""SELECT COUNT(*) FROM quickpoll_guests
+                         WHERE poll_id = ? AND confirmed = 1 AND LOWER(member_username) = LOWER(?)""",
+                      (poll_id, voter_username))
+            guest_count = c.fetchone()[0]
+            plan.append((voter_username, voter_user_id, guest_count, is_waived))
+            total_units += 1 + guest_count
+        conn.close()
+
         if total_units == 0:
             return
         per_unit = round(field_rate / total_units, 2)
@@ -2923,19 +2972,10 @@ class SoccerBotV2:
 
         charged, refunded, shortfalls = [], [], []
 
-        for voter_username, voter_user_id in in_voters:
+        for voter_username, voter_user_id, guest_count, is_waived in plan:
+            # already_paid for THIS poll = -(sum of confirmed charges/refunds tagged to it)
             wc = sqlite3.connect(DB_FILE)
             wcc = wc.cursor()
-            # Waiver holders pay nothing
-            wcc.execute("""SELECT 1 FROM payment_confirmations
-                           WHERE LOWER(username) = LOWER(?) AND notes LIKE ? AND status = 'waived'""",
-                        (voter_username, f"waiver:#{poll_id}%"))
-            is_waived = wcc.fetchone() is not None
-            wcc.execute("""SELECT COUNT(*) FROM quickpoll_guests
-                           WHERE poll_id = ? AND confirmed IN (1, 2) AND LOWER(member_username) = LOWER(?)""",
-                        (poll_id, voter_username))
-            guest_count = wcc.fetchone()[0]
-            # already_paid for THIS poll = -(sum of confirmed charges/refunds tagged to it)
             wcc.execute("""SELECT COALESCE(SUM(amount), 0) FROM payment_confirmations
                            WHERE LOWER(username) = LOWER(?) AND status = 'confirmed'
                              AND notes IN (?, ?)""",
@@ -2950,32 +2990,26 @@ class SoccerBotV2:
                 continue
 
             if delta > 0:
-                ok = self.deduct_wallet(voter_username, delta, f"quickpoll_vote:{poll_id}")
+                # F3: always charge the full share, pushing the wallet negative if
+                # needed (negative = owes). Nobody is dropped from a game at close
+                # for a low balance — maximize players.
+                ok = self.deduct_wallet(voter_username, delta, f"quickpoll_vote:{poll_id}",
+                                        allow_negative=True)
                 if ok:
                     w = self.get_wallet(voter_username)
                     new_bal = w['balance'] if w else 0
                     charged.append((voter_username, target, delta, guest_count, new_bal))
                     await self._dm_field_charge(voter_user_id, game_label, target, delta, new_bal, guest_count)
                 else:
-                    w = self.get_wallet(voter_username)
-                    bal = w['balance'] if w else 0
-                    short = round(delta - bal, 2)
-                    now_iso = datetime.now(TZ).isoformat()
-                    sc = sqlite3.connect(DB_FILE)
-                    scc = sc.cursor()
-                    scc.execute("""INSERT INTO payment_confirmations
-                                   (username, amount, payment_date, confirmed_date, status, notes)
-                                   VALUES (?, ?, ?, ?, 'pending', ?)""",
-                                (voter_username, -delta, now_iso, now_iso, f"quickpoll_vote:{poll_id}:shortfall"))
-                    sc.commit()
-                    sc.close()
-                    shortfalls.append((voter_username, voter_user_id, target, delta, short, guest_count))
+                    # Only reached when the voter has no wallet at all (can't push a
+                    # record that doesn't exist negative) — escalate to super-admin.
+                    shortfalls.append((voter_username, voter_user_id, target, delta, guest_count))
                     if voter_user_id:
                         try:
                             await self.application.bot.send_message(
                                 chat_id=voter_user_id,
-                                text=(f"⚠️ Your share for {game_label} is ${target:.2f}, but your wallet "
-                                      f"only has ${bal:.2f}. You're short ${short:.2f} — please top up to cover it."))
+                                text=(f"⚠️ Your share for {game_label} is ${target:.2f}, but you don't "
+                                      f"have a wallet yet — please set a username and top up to cover it."))
                         except Exception:
                             pass
             else:
@@ -3000,10 +3034,10 @@ class SoccerBotV2:
                     g = f" +{gcount}g" if gcount else ""
                     lines.append(f"  • @{u}{g}: ${r:.2f} (share ${tgt:.2f}, bal ${bal:.2f})")
             if shortfalls:
-                lines.append(f"\n⚠️ Shortfalls ({len(shortfalls)}):")
-                for u, uid, tgt, d, short, gcount in shortfalls:
+                lines.append(f"\n⚠️ No wallet — uncharged ({len(shortfalls)}):")
+                for u, uid, tgt, d, gcount in shortfalls:
                     g = f" +{gcount}g" if gcount else ""
-                    lines.append(f"  • @{u}{g}: needs ${d:.2f} (share ${tgt:.2f}, short ${short:.2f})")
+                    lines.append(f"  • @{u}{g}: owes ${d:.2f} (share ${tgt:.2f}) — no wallet")
             try:
                 await self.application.bot.send_message(chat_id=SUPER_ADMIN_ID, text="\n".join(lines))
             except Exception as e:
