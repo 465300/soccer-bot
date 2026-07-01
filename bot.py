@@ -89,7 +89,7 @@ ADMIN_COMMANDS = {
     'quickpoll', 'cancelquickpoll', 'closepoll', 'refreshpoll', 'maketeams',
     'setskill', 'skills', 'deleteskill',
     'listchats',
-    'sendvenmolink', 'waive', 'initchats',
+    'sendvenmolink', 'waive',
     'addplayer', 'removeplayer', 'addguest', 'nudge',
     'addmember', 'removemember', 'members',
     'pollreport', 'playerreport', 'setfieldrate',
@@ -123,7 +123,6 @@ MENU_ADMIN_LAYOUT = [
     [('⚙️ GROUPS', None)],
     [('🔀 Switch Grp', 'switchgroup'), ('📂 My Groups', 'mygroups'), ('📋 List Chats', 'listchats')],
     [('👑 Add Admin', 'addadmin'), ('🚫 Rm Admin', 'removeadmin'), ('👥 Admins', 'listadmins')],
-    [('📨 Init Chats', 'initchats')],
 ]
 MENU_SUPER_LAYOUT = [
     [('🔐 SUPER', None)],
@@ -136,7 +135,7 @@ MENU_DIRECT = {
     'closepoll', 'refreshpoll', 'nudge', 'maketeams',
     'setfieldrate', 'pollreport', 'playerreport',
     'members', 'skills',
-    'switchgroup', 'mygroups', 'listchats', 'listadmins', 'initchats',
+    'switchgroup', 'mygroups', 'listchats', 'listadmins',
 }
 # Commands that need arguments or start a wizard — tapping shows a usage hint.
 MENU_HINTS = {
@@ -294,53 +293,13 @@ class SoccerBotV2:
         return f"📍 {group_name} · /switchgroup to change\n\n"
 
     def _command_menus(self):
-        """The three role-based Telegram command menus. Admins get everything
-        the super admin does EXCEPT the money commands (super-only)."""
-        player_cmds = [
-            BotCommand('start', 'Get started / see what I can do'),
+        """All roles see only /start and /menu in the Telegram slash list.
+        Every other command is still callable by typing it directly."""
+        slim = [
+            BotCommand('start', 'Say hi'),
             BotCommand('menu', 'Open the command menu'),
-            BotCommand('wallet', 'Check your balance and recent activity'),
-            BotCommand('myreport', 'Your game-by-game cost history and wallet activity'),
-            BotCommand('topup', 'Add funds to join games ($10/game)'),
-            BotCommand('cashout', 'Withdraw your balance to Venmo'),
-            BotCommand('cancel', 'Cancel whatever you\'re doing right now'),
         ]
-        admin_ops_cmds = [
-            BotCommand('quickpoll', 'Set up a game poll for your group'),
-            BotCommand('closepoll', 'Close voting and post the final player list'),
-            BotCommand('refreshpoll', 'Push latest buttons to an existing poll card'),
-            BotCommand('addplayer', 'Force-add a player to the latest game — /addplayer @user [reason]'),
-            BotCommand('removeplayer', 'Force-remove a player from the latest game — /removeplayer @user'),
-            BotCommand('addguest', 'Add a guest under an IN player — /addguest @inviter <Guest Name>'),
-            BotCommand('nudge', 'Ping members who haven\'t voted yet — /nudge [poll_id]'),
-            BotCommand('addmember', 'Add players to the nudge roster — /addmember @user …'),
-            BotCommand('removemember', 'Remove players from the roster — /removemember @user …'),
-            BotCommand('members', 'Show the nudge roster'),
-            BotCommand('cancelquickpoll', 'Cancel a poll and refund everyone'),
-            BotCommand('maketeams', 'Split players into balanced skill-based teams'),
-            BotCommand('setskill', 'Set a player\'s skill rating — /setskill Name 1-10'),
-            BotCommand('skills', 'See all player skill ratings'),
-            BotCommand('deleteskill', 'Remove a player\'s skill rating'),
-            BotCommand('switchgroup', 'Choose which group to target with commands'),
-            BotCommand('mygroups', 'See all groups you manage'),
-            BotCommand('listchats', 'See all the groups you manage'),
-            BotCommand('sendvenmolink', 'Push the top-up card to a player — /sendvenmolink @user'),
-            BotCommand('waive', 'One-game wallet bypass for a player — /waive @user'),
-            BotCommand('initchats', 'Broadcast wallet setup invite to all your groups'),
-            BotCommand('addadmin', 'Give someone admin access — /addadmin @username'),
-            BotCommand('removeadmin', 'Revoke admin access — /removeadmin @username'),
-            BotCommand('listadmins', 'See all admins for a group'),
-            BotCommand('wallethistory', 'Full transaction history for a player — /wallethistory @user'),
-            BotCommand('pollreport', 'Per-game accounting report — shares, guests, who paid, totals'),
-            BotCommand('playerreport', 'View any player\'s game cost + wallet report'),
-            BotCommand('setfieldrate', 'Set/fix the field cost for a game — charges each player their share'),
-        ]
-        super_cmds = [
-            BotCommand('voidpayment', 'Reverse a payment — /voidpayment <id>'),
-            BotCommand('deletepayment', 'Delete a payment record — /deletepayment <id>'),
-            BotCommand('adjustbalance', 'Adjust wallet balance — /adjustbalance @user amount'),
-        ]
-        return player_cmds, admin_ops_cmds, super_cmds
+        return slim, slim, slim
 
     def _role_for(self, user) -> str:
         """'super' | 'admin' | 'member' for a Telegram user."""
@@ -392,12 +351,8 @@ class SoccerBotV2:
                         parse_mode='Markdown')
             except Exception:
                 pass
-        if role == 'super':
-            menu = super_cmds + admin_ops_cmds + player_cmds
-        elif role == 'admin':
-            menu = admin_ops_cmds + player_cmds
-        else:
-            menu = player_cmds
+        player_cmds, _, _ = self._command_menus()
+        menu = player_cmds  # same slim list for every role
         try:
             await self.application.bot.set_my_commands(menu, scope=BotCommandScopeChat(chat_id=user.id))
         except Exception as e:
@@ -2354,41 +2309,7 @@ class SoccerBotV2:
         data.name = filename
         return InputFile(data, filename=filename)
 
-    async def initchats_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """/initchats — Broadcast a DM-invite message to all groups you manage."""
-        user_id = update.effective_user.id
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("""SELECT cg.chat_id, cg.group_name
-                     FROM chat_groups cg
-                     JOIN chat_admins ca ON cg.chat_id = ca.chat_id
-                     WHERE ca.user_id = ?
-                     ORDER BY cg.group_name""", (user_id,))
-        groups = c.fetchall()
-        conn.close()
-        if not groups:
-            await self.send(update, "❌ No groups found. Add the bot to a group and run /setchat first.")
-            return
-        bot_info = await self.application.bot.get_me()
-        bot_username = bot_info.username
-        msg = (
-            "👋 *Game wallet setup*\n\n"
-            f"To vote IN on game polls, you need a wallet with the bot.\n\n"
-            f"📲 DM @{bot_username} and send /start to get set up — takes 30 seconds.\n\n"
-            "Each game costs $10, charged when you vote IN and refunded if you switch to OUT before the deadline."
-        )
-        sent, failed = 0, 0
-        for chat_id, group_name in groups:
-            try:
-                await self.application.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
-                sent += 1
-            except Exception as e:
-                logger.warning(f"initchats: could not send to {group_name} ({chat_id}): {e}")
-                failed += 1
-        summary = f"✅ Message sent to {sent} group{'s' if sent != 1 else ''}."
-        if failed:
-            summary += f" ⚠️ Failed to send to {failed} group{'s' if failed != 1 else ''} (check bot permissions)."
-        await self.send(update, summary)
+
 
     # ── UX-2: live-roster rendering helpers ───────────────────────────────
     def _esc(self, s) -> str:
@@ -5737,55 +5658,23 @@ class SoccerBotV2:
         # Pressing Start always (re)pushes this user's slash-command menu — the
         # reliable way a newly-added admin gets their commands to show up.
         await self.sync_user_commands(user, force=True)
-        if self.is_super_admin(user.id):
-            role = 'super'
-        elif self.is_admin_any_chat(user.id, user.username):
-            role = 'admin'
-        else:
-            role = 'player'
+        role = self._role_for(user)
 
-        greeting = "سلام گل گلاب\\! بذار بهت بگم چطوری میتونم در خدمتت باشم 🙌\n\n"
-        if role == 'super':
+        if role in ('super', 'admin'):
             body = (
-                "*👑 Group Management:*\n"
-                "/addadmin — Give someone admin access\n"
-                "/removeadmin — Revoke admin access\n"
-                "/listadmins — See all admins for a group\n"
-                "/listchats — See all groups you manage\n\n"
-                "*🗳 Game Operations:*\n"
-                "/quickpoll — Create a game poll for your group\n"
-                "/closepoll — Close voting early and send the final lineup for approval\n"
-                "/cancelquickpoll — Cancel a poll and refund everyone automatically\n"
-                "/maketeams — Split voted\\-in players into balanced teams\n"
-                "/setskill, /skills, /deleteskill — Manage skill ratings for fair team splits\n\n"
-                "*💰 Your Wallet:*\n"
-                "/wallet — Check your balance and recent activity\n"
-                "/topup — Add funds to join games\n"
-                "/cashout — Withdraw to Venmo\n\n"
-                "Just send /quickpoll to get started\\."
-            )
-        elif role == 'admin':
-            body = (
-                "*🗳 Game Operations:*\n"
-                "/quickpoll — Create a game poll for your group\n"
-                "/closepoll — Close voting early and send the final lineup for approval\n"
-                "/cancelquickpoll — Cancel a poll and refund everyone automatically\n"
-                "/maketeams — Split voted\\-in players into balanced teams\n"
-                "/setskill, /skills, /deleteskill — Manage skill ratings for fair team splits\n\n"
-                "*💰 Your Wallet:*\n"
-                "/wallet — Check your balance and recent activity\n"
-                "/topup — Add funds to join games\n"
-                "/cashout — Withdraw to Venmo\n\n"
-                "Just send /quickpoll to get started\\."
+                "Hey! 👋 Good to see you.\n\n"
+                "Use /menu to browse all commands, or just type / to pick one directly.\n\n"
+                "Quick starters: /quickpoll to set up a game, /wallet to check your balance."
             )
         else:
             body = (
-                "💰 /wallet — Check your balance and recent game activity\\.\n"
-                "💳 /topup — Add funds to your wallet so you can vote in on games\\. Each game costs $10\\.\n"
-                "💸 /cashout — Withdraw your balance back to Venmo anytime\\.\n\n"
-                "When there's a game poll in your group, tap *IN* to join — $10 is deducted from your wallet\\. Switch to *OUT* before the deadline to get it back\\."
+                "Hey! 👋 Welcome.\n\n"
+                "💰 /wallet — check your balance\n"
+                "➕ /topup — add funds ($10/game)\n"
+                "💸 /cashout — withdraw to Venmo\n\n"
+                "When there's a game poll in your group, tap IN to join — $10 is charged and refunded if you switch to OUT before the deadline."
             )
-        await self.send(update, greeting + body, parse_mode='MarkdownV2')
+        await self.send(update, body)
 
     async def unknown_message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Warm reply for unexpected messages in private chat."""
@@ -5938,7 +5827,6 @@ class SoccerBotV2:
         self.application.add_handler(CommandHandler('sendvenmolink', self.sendvenmolink_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('wallethistory', self.wallethistory_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('waive', self.waive_cmd, filters=filters.ChatType.PRIVATE))
-        self.application.add_handler(CommandHandler('initchats', self.initchats_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('pollreport', self.pollreport_cmd, filters=filters.ChatType.PRIVATE))
         self.application.add_handler(CommandHandler('setfieldrate', self.setfieldrate_cmd, filters=filters.ChatType.PRIVATE))
 
