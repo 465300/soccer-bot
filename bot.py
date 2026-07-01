@@ -15,6 +15,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeAllPrivateChats,
@@ -74,6 +75,7 @@ VENMO_HANDLE = '@chico-leo'  # Venmo handle players pay to for top-ups
 VOTE_COST = 10.00      # charged per IN vote, refunded on switch to OUT
 WALLET_FLOOR = 10.00   # minimum balance required to vote IN
 TOPUP_MIN = 20.00      # minimum custom top-up amount
+REPORT_START = datetime(2026, 5, 1)  # accounting start; games before this are excluded from reports
 
 # UX-3: how many hours before the deadline to auto-nudge non-voters.
 # Only intervals that still land in the future are scheduled, so short
@@ -1921,10 +1923,13 @@ class SoccerBotV2:
                 continue
         return None
 
-    def _pollreport_block(self, c, pid, gd, loc, fr, closed, roster):
-        """Build one game's accounting block from the charge ledger (authoritative).
-        Returns (html_text, stats). Guest counts come from each player's paid units,
-        never from the unreconciled quickpoll_votes/quickpoll_guests tables."""
+    def _pollreport_game_stats(self, c, pid, gd, loc, fr, closed, roster):
+        """Compute one game's accounting figures from the charge ledger (authoritative).
+        Returns a dict of fields (incl. the per-player ``paid`` map + ``per_unit`` so
+        the player section reuses identical per-share math). Everything is derived from
+        payment_confirmations (the ground-truth ledger): guest counts and who-brought-whom
+        come from each player's paid units, never from the unreconciled
+        quickpoll_votes/quickpoll_guests tables."""
         from collections import defaultdict
         paid = defaultdict(float)
         for u, a in c.execute("SELECT username, amount FROM payment_confirmations WHERE notes = ?",
@@ -1932,109 +1937,367 @@ class SoccerBotV2:
             paid[u] += abs(a)
         paid = {u: v for u, v in paid.items() if v > 0}
         field = fr or 0.0
-        date_lbl = self._esc(self._pretty_date(gd) if gd else 'TBD')
+        d = self._parse_game_date(gd)
+        date_iso = d.strftime('%Y-%m-%d') if d else (gd or 'TBD')
+        date_label = d.strftime('%b %d') if d else (gd or 'TBD')
+        cancelled = c.execute(
+            "SELECT 1 FROM payment_confirmations WHERE notes IN (?, ?) LIMIT 1",
+            (f'quickpoll_cancelled:{pid}', f'quickpoll_cancelled_out:{pid}')).fetchone()
+        if not closed:
+            status = 'open'
+        elif cancelled or not paid:
+            status = 'canceled'
+        else:
+            status = 'played'
+        base = {'pid': pid, 'date': date_iso, 'date_label': date_label,
+                'location': loc or '', 'status': status, 'field': field,
+                'paid': dict(paid)}
         if not paid:
-            txt = (f"🗓 <b>{date_lbl}</b> · {self._esc(loc or '')}\n"
-                   f"   <i>No charges recorded"
-                   + (f" · field ${field:.2f}" if field else "") + "</i>")
-            return txt, {'field': field, 'collected': 0.0, 'players': 0, 'guests': 0}
+            base.update({'per_unit': 0.0, 'per_share': 0.0, 'in_players': 0, 'guests': 0,
+                         'total_players': 0, 'collected': 0.0, 'surplus': -field, 'out': 0,
+                         'in_list': '', 'guests_detail': ''})
+            return base
         per_unit = min(paid.values())
-        rows, total_units = [], 0
+        bringers = {}
+        total_units = 0
         for u, amt in paid.items():
             units = round(amt / per_unit) if per_unit > 0 else 1
             total_units += units
-            rows.append((amt, units, u))
-        rows.sort(key=lambda r: (-r[0], r[2].lower()))
-        n_players = len(rows)
+            if units > 1:
+                bringers[u] = units - 1
+        n_players = len(paid)
         n_guests = total_units - n_players
         collected = sum(paid.values())
-        surplus = collected - field
-        lines = [f"🗓 <b>{date_lbl}</b> · {self._esc(loc or '')}"]
-        if n_guests:
-            detail = (f"{total_units} players ({n_players} in + "
-                      f"{n_guests} guest{'s' if n_guests != 1 else ''})")
-        else:
-            detail = f"{total_units} player{'s' if total_units != 1 else ''}"
-        lines.append(f"💵 Field ${field:.2f} · ${per_unit:.2f}/share · {detail}")
-        lines.append(f"✅ Collected ${collected:.2f}"
-                     + (f" · surplus ${surplus:.2f}" if abs(surplus) >= 0.005 else "")
-                     + ("" if closed else " · ⚠️ poll still open"))
-        lines.append(f"\n<b>IN ({n_players}):</b>")
-        for amt, units, u in rows:
-            extra = f" <i>(+{units - 1} guest{'s' if units - 1 != 1 else ''})</i>" if units > 1 else ""
-            lines.append(f"  @{self._esc(u)} — ${amt:.2f}{extra}")
-        bringers = [(u, units - 1) for amt, units, u in rows if units > 1]
-        if bringers:
-            lines.append("<b>Guests brought by:</b> "
-                         + ", ".join(f"@{self._esc(u)} (+{g})" for u, g in bringers))
         in_set = {u.lower() for u in paid}
         n_out = sum(1 for m in roster if m.lower() not in in_set)
-        lines.append(f"<b>OUT:</b> {n_out}")
-        return "\n".join(lines), {'field': field, 'collected': collected,
-                                  'players': n_players, 'guests': n_guests}
+        in_list = "; ".join(sorted(paid, key=str.lower))
+        guests_detail = "; ".join(f"{u} (+{bringers[u]})"
+                                  for u in sorted(bringers, key=str.lower))
+        base.update({'per_unit': per_unit, 'per_share': per_unit, 'in_players': n_players,
+                     'guests': n_guests, 'total_players': total_units, 'collected': collected,
+                     'surplus': collected - field, 'out': n_out, 'in_list': in_list,
+                     'guests_detail': guests_detail})
+        return base
 
     async def _render_pollreport(self, send_chat_id, group_chat_id, group_name, rng):
-        """Build and send the per-game accounting report for a group + period."""
+        """Build and send ONE accounting CSV (metrics + game table + player table +
+        legend + worked example) plus a compact monospace Telegram caption with
+        at-a-glance visuals. Reports cover games from REPORT_START (May 1, 2026)
+        onward — earlier games stay in the DB but are excluded here by design."""
         start, end = rng
+        if start is None or start < REPORT_START:
+            start = REPORT_START
+        if end is None:
+            end = datetime.now(TZ).replace(tzinfo=None)
+        start_str = start.strftime('%Y-%m-%d')
+        end_str = end.strftime('%Y-%m-%d')
+        period = self._report_period_label(start, end)
+
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         roster = [r[0] for r in c.execute("SELECT username FROM wallets ORDER BY LOWER(username)")]
+        balances = {r[0]: (float(r[1] or 0), int(r[2] or 0))
+                    for r in c.execute("SELECT username, balance, first_paid FROM wallets")}
         polls = c.execute(
             "SELECT id, game_date, location_name, field_rate, closed FROM quickpolls WHERE chat_id = ?",
             (group_chat_id,)).fetchall()
         selected = []
         for pid, gd, loc, fr, closed in polls:
             d = self._parse_game_date(gd)
-            if start and end and (not d or not (start <= d <= end)):
+            if not d or not (start <= d <= end):
                 continue
-            selected.append((d or datetime.max, pid, gd, loc, fr, closed))
+            selected.append((d, pid, gd, loc, fr, closed))
         selected.sort(key=lambda x: x[0])
-
-        blocks = []
-        tot_field = tot_collected = 0.0
-        tot_players = tot_guests = 0
-        for _, pid, gd, loc, fr, closed in selected:
-            block, stats = self._pollreport_block(c, pid, gd, loc, fr, closed, roster)
-            blocks.append(block)
-            tot_field += stats['field']
-            tot_collected += stats['collected']
-            tot_players += stats['players']
-            tot_guests += stats['guests']
+        games = [self._pollreport_game_stats(c, pid, gd, loc, fr, closed, roster)
+                 for _, pid, gd, loc, fr, closed in selected]
+        players = self._pollreport_player_stats(c, games, start_str, end_str, balances)
         conn.close()
 
-        if not blocks:
+        if not games and not players:
             await self.application.bot.send_message(
-                send_chat_id, f"No games found for {group_name} in that period.")
+                send_chat_id, f"No activity for {group_name} in {period}.")
             return
-        period_lbl = (f"{start.strftime('%b %d')} – {end.strftime('%b %d, %Y')}"
-                      if start and end else "all games")
-        header = (f"📊 <b>{self._esc(group_name)} — Accounting Report</b>\n"
-                  f"<i>{period_lbl} · {len(blocks)} game{'s' if len(blocks) != 1 else ''}</i>")
-        footer = ("═══════════\n"
-                  f"<b>TOTALS · {len(blocks)} game{'s' if len(blocks) != 1 else ''}</b>\n"
-                  f"Field cost: ${tot_field:.2f} · Collected: ${tot_collected:.2f} "
-                  f"(surplus ${tot_collected - tot_field:.2f})\n"
-                  f"Players: {tot_players} · Guests: {tot_guests}")
-        await self._send_report_chunks(send_chat_id, header, blocks, footer)
 
-    async def _send_report_chunks(self, chat_id, header, blocks, footer):
-        """Send header + game blocks + footer, splitting into <4000-char messages."""
-        msg = header
-        for b in blocks:
-            if len(msg) + len(b) + 2 > 3900:
-                await self.application.bot.send_message(
-                    chat_id, msg, parse_mode='HTML', disable_web_page_preview=True)
-                msg = ""
-            msg += ("\n\n" if msg else "") + b
-        if len(msg) + len(footer) + 2 > 3900:
-            await self.application.bot.send_message(
-                chat_id, msg, parse_mode='HTML', disable_web_page_preview=True)
-            msg = footer
+        metrics = self._report_metrics(games, players, balances)
+        rows = self._build_report_rows(group_name, period, games, players, metrics)
+        safe_group = ''.join(ch for ch in group_name if ch.isalnum()) or "group"
+        fname = f"{safe_group}_Report_{start_str}_to_{end_str}.csv"
+        doc = self._csv_document(fname, rows)
+        caption = self._report_caption(group_name, period, metrics)
+        await self.application.bot.send_document(
+            send_chat_id, document=doc, caption=caption, parse_mode='HTML')
+
+    # ---- reporting helpers -------------------------------------------------
+
+    def _report_period_label(self, start, end):
+        """Human period label: 'May 2026' (whole month) · 'May 1 to May 25, 2026'
+        (same-year range) · '… , 2026 to …, 2027' (cross-year)."""
+        today = datetime.now(TZ).date()
+        s, e = start.date(), end.date()
+        month_last = ((start.replace(day=28) + timedelta(days=4)).replace(day=1)
+                      - timedelta(days=1)).date()
+        if s.day == 1 and s.year == e.year and s.month == e.month and (e >= month_last or e == today):
+            return start.strftime('%B %Y')
+        if s.year == e.year:
+            return f"{start.strftime('%B')} {s.day} to {end.strftime('%B')} {e.day}, {e.year}"
+        return (f"{start.strftime('%B')} {s.day}, {s.year} to "
+                f"{end.strftime('%B')} {e.day}, {e.year}")
+
+    def _money(self, v, signed=False):
+        """Format a dollar amount. Rounds the -0.00 artifact to $0.00."""
+        v = float(v or 0)
+        if abs(v) < 0.005:
+            return "$0.00"
+        if v < 0:
+            return f"-${abs(v):,.2f}"
+        return f"+${v:,.2f}" if signed else f"${v:,.2f}"
+
+    def _bar(self, value, maxval, width=6):
+        """Solid block bar scaled to maxval (min one block when value > 0)."""
+        if not maxval or maxval <= 0:
+            return ''
+        n = round(value / maxval * width)
+        if value > 0 and n == 0:
+            n = 1
+        return '█' * n
+
+    def _spark(self, values):
+        """Compress a series into a one-line sparkline (▁▂▃▄▅▆▇█)."""
+        blocks = "▁▂▃▄▅▆▇█"
+        vals = [v for v in values]
+        if not vals:
+            return ''
+        mx = max(vals)
+        if mx <= 0:
+            return blocks[0] * len(vals)
+        return ''.join(blocks[min(len(blocks) - 1, round(v / mx * (len(blocks) - 1)))]
+                       for v in vals)
+
+    def _pollreport_player_stats(self, c, games, start_str, end_str, balances):
+        """Per-player accounting. Field/guest figures come from the game charge maps
+        (same per-share math as the game table); cash flow (Venmo in / refunds /
+        cashouts / adjustments) comes from confirmed ledger rows dated inside the
+        window; balance_all_time comes from the wallet (all-time, not window)."""
+        from collections import defaultdict
+        fld = defaultdict(lambda: {'field': 0.0, 'own': 0.0, 'guest_cost': 0.0,
+                                   'guests': 0, 'games': 0, 'dates': []})
+        for g in games:
+            per = g['per_unit']
+            for u, amt in g['paid'].items():
+                r = fld[u]
+                r['field'] += amt
+                r['own'] += per
+                r['guest_cost'] += max(0.0, amt - per)
+                units = round(amt / per) if per > 0 else 1
+                r['guests'] += max(0, units - 1)
+                r['games'] += 1
+                r['dates'].append(g['date_label'])
+        cash = defaultdict(lambda: {'venmo': 0.0, 'refunds': 0.0, 'cashouts': 0.0, 'other': 0.0})
+        for uname, amt, notes, dt in c.execute(
+                "SELECT username, amount, notes, COALESCE(confirmed_date, payment_date) "
+                "FROM payment_confirmations WHERE status = 'confirmed' "
+                "AND (notes IS NULL OR notes NOT LIKE 'waiver:%')"):
+            if not uname:
+                continue
+            day = (dt or '')[:10]
+            if start_str and end_str and not (start_str <= day <= end_str):
+                continue
+            amt = float(amt or 0)
+            n = notes or ''
+            r = cash[uname]
+            if n.startswith('topup'):
+                r['venmo'] += amt
+            elif n.startswith('quickpoll_vote'):
+                pass  # field/guest handled from the game charge maps above
+            elif n.startswith('quickpoll_refund') or n.startswith('quickpoll_cancelled'):
+                r['refunds'] += amt
+            elif n.startswith('cashout'):
+                r['cashouts'] += abs(amt)
+            else:
+                r['other'] += amt
+        bal_map = {u.lower(): (b, fp) for u, (b, fp) in balances.items()}
+        out = []
+        for u in sorted(set(fld) | set(cash), key=str.lower):
+            f = fld.get(u, {'field': 0, 'own': 0, 'guest_cost': 0, 'guests': 0, 'games': 0, 'dates': []})
+            m = cash.get(u, {'venmo': 0, 'refunds': 0, 'cashouts': 0, 'other': 0})
+            bal, fp = bal_map.get(u.lower(), (0.0, 0))
+            net = m['venmo'] - f['field'] + m['refunds'] - m['cashouts'] + m['other']
+            out.append({
+                'username': u, 'games': f['games'], 'dates': list(f['dates']),
+                'own': f['own'], 'guests': f['guests'], 'guest_cost': f['guest_cost'],
+                'field': f['field'], 'venmo': m['venmo'], 'refunds': m['refunds'],
+                'cashouts': m['cashouts'], 'other': m['other'], 'net': net,
+                'balance': bal, 'eligible': 'yes' if (bal > WALLET_FLOOR and fp) else 'no',
+            })
+        return out
+
+    def _report_metrics(self, games, players, balances):
+        """Roll up the headline figures shared by the CSV metrics block and caption."""
+        played = [g for g in games if g['status'] == 'played']
+        canceled = [g for g in games if g['status'] == 'canceled']
+        open_g = [g for g in games if g['status'] == 'open']
+        tot_field = sum(g['field'] for g in games)
+        tot_collected = sum(g['collected'] for g in games)
+        avg_players = (sum(g['in_players'] for g in played) / len(played)) if played else 0.0
+        avg_share = (sum(g['per_unit'] for g in played) / len(played)) if played else 0.0
+        debtors = sorted((p for p in players if p['balance'] < 0), key=lambda p: p['balance'])
+        return {
+            'played': len(played), 'canceled': len(canceled), 'open': len(open_g),
+            'total': len(games), 'field': tot_field, 'collected': tot_collected,
+            'net': tot_collected - tot_field,
+            'attendances': sum(g['in_players'] for g in games),
+            'guests': sum(g['guests'] for g in games),
+            'avg_players': avg_players, 'avg_share': avg_share,
+            'sum_balances': sum(b for b, _ in balances.values()),
+            'debtors': debtors,
+            'attendance_series': [g['in_players'] for g in played],
+            'most_active': sorted((p for p in players if p['games'] > 0),
+                                  key=lambda p: -p['games'])[:3],
+        }
+
+    def _build_report_rows(self, group_name, period, games, players, m):
+        """Assemble every row of the single combined CSV."""
+        rows = [
+            [f"{group_name.upper()} — ACCOUNTING REPORT · {period}"],
+            ["Generated", datetime.now(TZ).strftime('%Y-%m-%d'), "Group", group_name],
+            [],
+            ["=== KEY METRICS ==="],
+            ["Games (played / canceled / total)",
+             f"{m['played']} / {m['canceled']} / {m['total']}"],
+            ["Total field cost", self._money(m['field'])],
+            ["Total collected", self._money(m['collected'])],
+            ["NET (collected − field cost)", self._money(m['net'], signed=True)],
+            ["Total attendances (player-appearances across games)", m['attendances']],
+            ["Guests", m['guests']],
+            ["Avg players / game (played)", f"{m['avg_players']:.1f}"],
+            ["Avg $/share (played)", self._money(m['avg_share'])],
+            ["Sum of current balances (all-time)", self._money(m['sum_balances'])],
+            ["Players in debt (balance < 0)",
+             (f"{len(m['debtors'])} (owes {self._money(sum(-p['balance'] for p in m['debtors']))})"
+              if m['debtors'] else "0")],
+            [],
+            ["=== GAME LEVEL SUMMARY ==="],
+            ["date", "location", "status", "field_cost", "per_share", "in_players",
+             "guests", "total_players", "collected", "surplus", "no_shows",
+             "in_players_list", "guests_brought_by"],
+        ]
+        tot_field = tot_collected = tot_surplus = 0.0
+        tot_in = tot_guests = tot_players = tot_out = 0
+        for g in games:
+            played = g['status'] == 'played'
+            rows.append([
+                g['date'], g['location'], g['status'], self._money(g['field']),
+                self._money(g['per_share']) if g['total_players'] else '—',
+                g['in_players'], g['guests'], g['total_players'],
+                self._money(g['collected']) if played else '—',
+                self._money(g['surplus'], signed=True) if played else '—',
+                g['out'], g['in_list'], g['guests_detail'],
+            ])
+            tot_field += g['field']; tot_collected += g['collected']
+            tot_surplus += g['surplus']; tot_in += g['in_players']
+            tot_guests += g['guests']; tot_players += g['total_players']; tot_out += g['out']
+        rows.append([
+            "TOTALS", f"{len(games)} games", '', self._money(tot_field), '',
+            tot_in, tot_guests, tot_players, self._money(tot_collected),
+            self._money(tot_surplus, signed=True), tot_out, '', '',
+        ])
+        rows += [
+            [],
+            ["=== PLAYER LEVEL REPORT ==="],
+            ["username", "games_played", "games", "own_share", "guests_brought",
+             "guest_cost", "field_paid", "venmo_in", "refunds", "cashouts",
+             "other_adjustments", "net_period", "balance_all_time", "eligible_to_play"],
+        ]
+        s = {'own': 0.0, 'guest_cost': 0.0, 'field': 0.0, 'venmo': 0.0,
+             'refunds': 0.0, 'cashouts': 0.0, 'other': 0.0, 'net': 0.0,
+             'guests': 0, 'games': 0}
+        for p in players:
+            rows.append([
+                p['username'], p['games'], "; ".join(p['dates']),
+                self._money(p['own']), p['guests'], self._money(p['guest_cost']),
+                self._money(p['field']), self._money(p['venmo']), self._money(p['refunds']),
+                self._money(p['cashouts']), self._money(p['other']),
+                self._money(p['net'], signed=True), self._money(p['balance']),
+                p['eligible'],
+            ])
+            for k in ('own', 'guest_cost', 'field', 'venmo', 'refunds', 'cashouts', 'other', 'net', 'guests', 'games'):
+                s[k] += p[k]
+        rows.append([
+            "TOTALS", s['games'], '', self._money(s['own']), s['guests'],
+            self._money(s['guest_cost']), self._money(s['field']), self._money(s['venmo']),
+            self._money(s['refunds']), self._money(s['cashouts']), self._money(s['other']),
+            self._money(s['net'], signed=True), '', '',
+        ])
+        rows += [
+            [],
+            ["=== LEGEND & NOTES ==="],
+            ["per_share", "field_cost ÷ total player-units (IN + guests). Each charge is rounded up to the cent, so 'collected' can slightly exceed field cost (rounding surplus)."],
+            ["guests", "The inviter pays their own share PLUS one share per guest (N+1). 'guests_brought_by' shows who brought how many."],
+            ["surplus", "collected − field_cost for that game. Positive = over-collected/rounding; negative = shortfall."],
+            ["status", "played = charged · canceled = no charges · open = poll still live."],
+            ["no_shows", "Roster members who did not play that game."],
+            ["own_share / guest_cost", "own_share = the player's own spot; guest_cost = the extra they paid for guests they brought. field_paid = own_share + guest_cost."],
+            ["net_period", "Cash flow within THIS report window only: venmo_in − field_paid + refunds − cashouts + adjustments. Activity outside the window is NOT here."],
+            ["balance_all_time", "Current wallet balance across ALL time. A top-up made before this window still counts here — that's why it can differ from net_period. Negative = the player owes."],
+            ["eligible_to_play", "yes = wallet balance is above the minimum and the player has paid in at least once, so they can vote IN. no = must top up before joining a game."],
+            ["period", "Covers games from May 1, 2026 onward (the bot's accounting start). Earlier games are excluded by design."],
+            [],
+            ["=== WORKED EXAMPLE ==="],
+            ["On May 5 the field cost $90 and 11 shares were played (10 players + 1 guest), so each share = $90 ÷ 11 = $8.19."],
+            ["Ali Nazem brought 1 guest, so he covered 2 shares = 2 × $8.19 = $16.38. Everyone else paid one share ($8.19)."],
+            ["Because each charge is rounded up to the cent, the group collected $90.09 — the extra $0.09 is the 'surplus'."],
+        ]
+        return rows
+
+    def _report_caption(self, group_name, period, m):
+        """Compact monospace (<pre>) caption: headline numbers + attendance sparkline,
+        debtors, and most-active players with bar charts. Emoji only at line ends so
+        the fixed-width columns never misalign."""
+        W = 27
+        L = [f"📊 {group_name.upper()} · {period}", "━" * W]
+
+        def line(label, val, extra=''):
+            return f" {label:<10}{val}" + (f"   {extra}" if extra else '')
+
+        tick = "✅ covered" if m['net'] >= 0 else "🔴 shortfall"
+        L.append(line("NET", self._money(m['net'], signed=True), tick))
+        L.append(line("Collected", self._money(m['collected'])))
+        L.append(line("Field", self._money(m['field'])))
+        gsum = f"{m['played']} played"
+        if m['canceled']:
+            gsum += f" · {m['canceled']} canceled"
+        if m['open']:
+            gsum += f" · {m['open']} open"
+        L.append(line("Games", gsum))
+        spark = self._spark(m['attendance_series'])
+        L.append(line("Avg/game", f"{m['avg_players']:.1f}", spark))
+        L.append("━" * W)
+
+        debt = m['debtors']
+        if debt:
+            L.append(" Owes (current balance)")
+            maxo = max(abs(p['balance']) for p in debt)
+            for p in debt[:3]:
+                L.append(f"  {p['username']}  {self._money(p['balance'])}  "
+                         f"{self._bar(abs(p['balance']), maxo)}")
         else:
-            msg += ("\n\n" if msg else "") + footer
-        if msg:
-            await self.application.bot.send_message(
-                chat_id, msg, parse_mode='HTML', disable_web_page_preview=True)
+            L.append(" Owes   none ✅")
+        active = m['most_active']
+        if active:
+            L.append(" Most active (games this period)")
+            maxa = max(p['games'] for p in active)
+            for p in active:
+                L.append(f"  {p['username']}  {p['games']}  {self._bar(p['games'], maxa)}")
+        return "<pre>" + self._esc("\n".join(L)) + "</pre>"
+
+    def _csv_document(self, filename, rows):
+        """Build an in-memory CSV file (UTF-8 BOM for Excel) as a Telegram InputFile."""
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerows(rows)
+        data = io.BytesIO(buf.getvalue().encode('utf-8-sig'))
+        data.name = filename
+        return InputFile(data, filename=filename)
 
     async def initchats_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/initchats — Broadcast a DM-invite message to all groups you manage."""
