@@ -1005,8 +1005,60 @@ class SoccerBotV2:
         conn.close()
         return True
 
+    def _poll_id_from_notes(self, notes: str):
+        """Extract the poll_id from a quickpoll-tagged ledger note, else None."""
+        if not notes:
+            return None
+        for prefix in ('quickpoll_vote:', 'quickpoll_refund:',
+                       'quickpoll_cancelled_out:', 'quickpoll_cancelled:'):
+            if notes.startswith(prefix):
+                try:
+                    return int(notes[len(prefix):].split(':')[0])
+                except (ValueError, IndexError):
+                    return None
+        return None
+
+    def _wallet_summary(self, username: str) -> dict:
+        """Full-ledger rollup for a player (ignores any display limit): games
+        played + total game spend, plus Venmo in / refunds / cash-outs."""
+        from collections import defaultdict
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        rows = c.execute(
+            "SELECT amount, notes FROM payment_confirmations "
+            "WHERE LOWER(username) = LOWER(?) AND status = 'confirmed' "
+            "AND (notes IS NULL OR notes NOT LIKE 'waiver:%')",
+            (username,)).fetchall()
+        conn.close()
+        by_poll = defaultdict(float)
+        venmo = refunds = cashouts = 0.0
+        for amt, notes in rows:
+            amt = float(amt or 0)
+            n = notes or ''
+            if n.startswith('quickpoll_vote'):
+                pid = self._poll_id_from_notes(n)
+                if pid is not None:
+                    by_poll[pid] += abs(amt)
+            elif n.startswith('topup'):
+                venmo += amt
+            elif n.startswith('quickpoll_refund') or n.startswith('quickpoll_cancelled'):
+                refunds += amt
+            elif n.startswith('cashout'):
+                cashouts += abs(amt)
+        return {
+            'games': sum(1 for v in by_poll.values() if v > 0),
+            'spend': sum(by_poll.values()),
+            'venmo': venmo,
+            'refunds': refunds,
+            'cashouts': cashouts,
+        }
+
     def get_payment_history(self, username: str, limit: int = 10) -> list[dict]:
-        """Fetch payment history for user, newest first."""
+        """Fetch payment history for user, newest first. Game-related rows
+        (quickpoll_*) resolve to the real game date from quickpolls; the ledger's
+        confirmed_date is only the bookkeeping date (e.g. the June-30 migration
+        day), so top-ups / cash-outs keep confirmed_date while votes / refunds
+        carry game_date."""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("""SELECT id, amount, payment_date, confirmed_date, status, notes
@@ -1016,6 +1068,15 @@ class SoccerBotV2:
                     ORDER BY confirmed_date DESC LIMIT ?""",
                  (username, limit))
         rows = c.fetchall()
+
+        poll_ids = {pid for pid in (self._poll_id_from_notes(r[5]) for r in rows)
+                    if pid is not None}
+        game_dates = {}
+        if poll_ids:
+            qmarks = ",".join("?" * len(poll_ids))
+            game_dates = {pid: gd for pid, gd in c.execute(
+                f"SELECT id, game_date FROM quickpolls WHERE id IN ({qmarks})",
+                tuple(poll_ids))}
         conn.close()
 
         return [
@@ -1025,7 +1086,13 @@ class SoccerBotV2:
                 'payment_date': row[2],
                 'confirmed_date': row[3],
                 'status': row[4],
-                'notes': row[5]
+                'notes': row[5],
+                'game_date': (gd := game_dates.get(self._poll_id_from_notes(row[5]))),
+                # Real-world date to show: game date for game rows, the actual
+                # Venmo-in (payment) date for top-ups, else the ledger date. The
+                # migration stamped every confirmed_date to the run day (Jun 30),
+                # so confirmed_date is only a last-resort fallback.
+                'display_date': gd or row[2] or row[3],
             }
             for row in rows
         ]
@@ -1305,7 +1372,7 @@ class SoccerBotV2:
                 amt = h['amount']
                 sign = "+" if amt >= 0 else "−"
                 label = self._txn_label(h['notes'])
-                when = self._short_date(h['confirmed_date'])
+                when = self._short_date(h['display_date'])
                 text += f"  {sign}${abs(amt):.2f}  {label}  _{when}_\n"
         await self.send(update, text, parse_mode='Markdown')
 
@@ -1769,12 +1836,25 @@ class SoccerBotV2:
         if not history:
             await self.send(update, f"No payment history for `{raw_username}`.", parse_mode='Markdown')
             return
-        lines = [f"💳 *Wallet history* — `{raw_username}`", f"Current balance: *${wallet['balance']:.2f}*\n"]
+
+        history.sort(key=lambda h: ((h['display_date'] or '')[:10], h['confirmed_date'] or ''),
+                     reverse=True)
+
+        summ = self._wallet_summary(raw_username)
+        lines = [
+            f"💳 *Wallet history* — `{raw_username}`",
+            f"Current balance: *${wallet['balance']:.2f}*",
+            "",
+            "📊 *Summary*",
+            f"Games played: *{summ['games']}*  ·  Game spend: *${summ['spend']:.2f}*",
+            f"Venmo in: *${summ['venmo']:.2f}*  ·  Refunds: *${summ['refunds']:.2f}*  ·  Cash-outs: *${summ['cashouts']:.2f}*",
+            "",
+        ]
         for h in history:
             amt = h['amount']
             sign = "+" if amt >= 0 else "−"
             label = self._txn_label(h['notes'])
-            when = self._short_date(h['confirmed_date'])
+            when = self._short_date(h['display_date'])
             status = f" _{h['status']}_" if h['status'] != 'confirmed' else ""
             lines.append(f"`#{h['id']}` {sign}${abs(amt):.2f}  {label}{status}  _{when}_")
         await self.send(update, "\n".join(lines), parse_mode='Markdown')
