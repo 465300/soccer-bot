@@ -93,18 +93,18 @@ def t_menus():
     check('M3 admin menu has addadmin/removeadmin/listadmins',
           {'addadmin', 'removeadmin', 'listadmins'} <= admin_names, admin_names)
     check('M4 admin menu has wallethistory', 'wallethistory' in admin_names)
-    check('M5 admin menu EXCLUDES money cmds',
-          not ({'voidpayment', 'deletepayment', 'adjustbalance'} & admin_names), admin_names)
-    check('M6 super menu = money cmds only',
-          sup_names == {'voidpayment', 'deletepayment', 'adjustbalance'}, sup_names)
+    check('M5 admin cmds INCLUDE money cmds',
+          {'voidpayment', 'deletepayment', 'adjustbalance'} <= botmod.ADMIN_COMMANDS)
+    check('M6 super menu same as all (slim, no dedicated super section)',
+          sup_names == {'start', 'menu'}, sup_names)
 
 def t_constants():
-    check('C1 money cmds super-only', botmod.SUPER_ADMIN_ONLY_COMMANDS == {'voidpayment', 'deletepayment', 'adjustbalance'},
+    check('C1 SUPER_ADMIN_ONLY_COMMANDS is empty (no super distinction)', botmod.SUPER_ADMIN_ONLY_COMMANDS == set(),
           botmod.SUPER_ADMIN_ONLY_COMMANDS)
     check('C2 admin cmds include admin mgmt',
           {'addadmin', 'removeadmin', 'listadmins', 'wallethistory'} <= botmod.ADMIN_COMMANDS)
-    check('C3 admin cmds exclude money',
-          not ({'voidpayment', 'deletepayment', 'adjustbalance'} & botmod.ADMIN_COMMANDS))
+    check('C3 admin cmds INCLUDE money cmds',
+          {'voidpayment', 'deletepayment', 'adjustbalance'} <= botmod.ADMIN_COMMANDS)
 
 # ---- role detection --------------------------------------------------------
 
@@ -147,10 +147,10 @@ async def t_sync():
     check('S4 member gets player menu', fbot.menus and fbot.menus[-1][1] == ['start', 'wallet', 'topup', 'cashout', 'cancel'],
           fbot.menus[-1][1] if fbot.menus else None)
 
-    # S5 super force-push includes money cmds
+    # S5 super force-push gets same slim menu (no dedicated super section)
     reset_db(); b, fbot = new_bot()
     await b.sync_user_commands(user(SUPER, 'boss'), force=True)
-    check('S5 super menu has money cmds', fbot.menus and {'voidpayment', 'adjustbalance'} <= set(fbot.menus[-1][1]))
+    check('S5 super gets slim menu', fbot.menus and set(fbot.menus[-1][1]) == {'start', 'menu'})
 
 # ---- guard authorization ---------------------------------------------------
 
@@ -176,11 +176,11 @@ async def t_guard():
     check('G2 admin allowed /listadmins', await run_guard(b, update_for(222, 'bob', '/listadmins')) == 'allowed')
     check('G2 admin allowed /wallethistory', await run_guard(b, update_for(222, 'bob', '/wallethistory @x')) == 'allowed')
 
-    # G3 admin BLOCKED from money commands
+    # G3 admin now ALLOWED money commands (no super-admin distinction)
     reset_db(); b, fbot = new_bot()
     seed_admin(-100, 222, 'bob')
-    check('G3 admin blocked /adjustbalance', await run_guard(b, update_for(222, 'bob', '/adjustbalance @x 5')) == 'blocked')
-    check('G3 admin blocked /voidpayment', await run_guard(b, update_for(222, 'bob', '/voidpayment 1')) == 'blocked')
+    check('G3 admin allowed /adjustbalance', await run_guard(b, update_for(222, 'bob', '/adjustbalance @x 5')) == 'allowed')
+    check('G3 admin allowed /voidpayment', await run_guard(b, update_for(222, 'bob', '/voidpayment 1')) == 'allowed')
 
     # G4 member blocked from admin commands, allowed player commands
     reset_db(); b, fbot = new_bot()

@@ -68,7 +68,7 @@ CANCEL_QP_REASON = 123
 CANCEL_QP_GROUP  = 124
 
 # ===== Payment / wallet config =====
-VENMO_HANDLE = '@chico-leo'  # Venmo handle players pay to for top-ups
+VENMO_HANDLE = '@Amin_Moghadasi'  # Venmo handle players pay to for top-ups
 VOTE_COST = 10.00      # charged per IN vote, refunded on switch to OUT
 WALLET_FLOOR = 10.00   # minimum balance required to vote IN
 TOPUP_MIN = 20.00      # minimum custom top-up amount
@@ -93,12 +93,11 @@ ADMIN_COMMANDS = {
     'addplayer', 'removeplayer', 'addguest', 'nudge',
     'addmember', 'removemember', 'members',
     'pollreport', 'playerreport', 'setfieldrate',
-    # Admins get everything except the money commands below.
     'addadmin', 'removeadmin', 'listadmins', 'wallethistory',
     'switchgroup', 'mygroups',
+    'voidpayment', 'deletepayment', 'adjustbalance',
 }
-# Money commands stay super-admin-only (super admin's personal Venmo account).
-SUPER_ADMIN_ONLY_COMMANDS = {'voidpayment', 'deletepayment', 'adjustbalance'}
+SUPER_ADMIN_ONLY_COMMANDS: set = set()  # No longer used — all admin commands are available to all admins.
 
 # ── /menu hub ────────────────────────────────────────────────────────────────
 # Inline command launcher. Each cell is (emoji-label, command). A command of
@@ -117,6 +116,7 @@ MENU_ADMIN_LAYOUT = [
     [('💰 MONEY', None)],
     [('💵 Field Rate', 'setfieldrate'), ('📋 Poll Report', 'pollreport'), ('🧾 Player Report', 'playerreport')],
     [('📜 Wallet Hx', 'wallethistory'), ('🔗 Venmo Link', 'sendvenmolink'), ('🎟️ Waive', 'waive')],
+    [('↩️ Void Pay', 'voidpayment'), ('🗑️ Del Pay', 'deletepayment'), ('⚖️ Adjust Bal', 'adjustbalance')],
     [('👥 ROSTER', None)],
     [('➕ Member', 'addmember'), ('➖ Member', 'removemember'), ('📇 Members', 'members')],
     [('⭐ Set Skill', 'setskill'), ('📈 Skills', 'skills'), ('🗑️ Del Skill', 'deleteskill')],
@@ -124,10 +124,7 @@ MENU_ADMIN_LAYOUT = [
     [('🔀 Switch Grp', 'switchgroup'), ('📂 My Groups', 'mygroups'), ('📋 List Chats', 'listchats')],
     [('👑 Add Admin', 'addadmin'), ('🚫 Rm Admin', 'removeadmin'), ('👥 Admins', 'listadmins')],
 ]
-MENU_SUPER_LAYOUT = [
-    [('🔐 SUPER', None)],
-    [('↩️ Void Pay', 'voidpayment'), ('🗑️ Del Pay', 'deletepayment'), ('⚖️ Adjust Bal', 'adjustbalance')],
-]
+MENU_SUPER_LAYOUT: list = []  # No longer used — all admins see the full admin menu.
 # Commands that run directly on tap (no-arg display / picker commands). Each maps
 # to a method named f'{cmd}_cmd'.
 MENU_DIRECT = {
@@ -5617,8 +5614,6 @@ class SoccerBotV2:
         role = self._role_for(user)
         if role in ('super', 'admin'):
             layout = list(MENU_ADMIN_LAYOUT)
-            if role == 'super':
-                layout = layout + MENU_SUPER_LAYOUT
             header = "🛡️ <b>Admin Menu</b> — tap a command"
         else:
             layout = MENU_PLAYER_LAYOUT
